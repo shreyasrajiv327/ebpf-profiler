@@ -1,0 +1,53 @@
+# Build outputs
+build_cmake/
+build/
+*.o
+*.a
+*.so
+
+# BPF compiled objects
+*.bpf.o
+
+# Binaries
+profiler
+test_target
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+install_manifest.txt
+
+# Profiler runtime outputs
+stacks.folded
+*.folded
+perf.data
+perf.data.old
+flamegraph.svg
+*.svg
+
+# BPF pinned maps (shouldn't be in repo)
+/sys/fs/bpf/
+
+# Debug / core dumps
+core
+core.*
+*.core
+vgcore.*
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.clangd/
+compile_commands.json
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db

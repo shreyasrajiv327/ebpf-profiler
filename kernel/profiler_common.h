@@ -44,6 +44,7 @@ struct func_entry {
     __u64 entry_ts;
     __u32 func_id;
     __u32 pad;
+    __s32 user_stack_id; 
 };
 
 #endif /* PROFILER_COMMON_H */
