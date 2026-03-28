@@ -37,15 +37,15 @@ struct {
     __type(value, struct off_cpu_val);
 } off_cpu_data SEC(".maps");
 
-/* Metadata: uprobe offset → func_id */
+/* Metadata: runtime address → func_id */
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 1024);
-    __type(key,   __u64);  /* offset/IP */
+    __type(key,   __u64);  /* runtime address */
     __type(value, __u32);  /* func_id */
 } uprobe_metadata SEC(".maps");
 
-/* Stack trace map */
+/* Stack trace maps */
 struct {
     __uint(type, BPF_MAP_TYPE_STACK_TRACE);
     __uint(max_entries, 8192);
@@ -72,23 +72,14 @@ int generic_entry(struct pt_regs *ctx)
     __u32 key = 0;
     __u32 *tpid = bpf_map_lookup_elem(&target_pid, &key);
     if (!tpid || *tpid == 0) return 0;
-    
+
     __u64 pid_tgid = bpf_get_current_pid_tgid();
     __u32 pid = pid_tgid >> 32;
     __u32 tid = (__u32)pid_tgid;
     if (pid != *tpid) return 0;
 
-    /*
-     * Get instruction pointer - this is where uprobe was attached.
-     * We use this to look up func_id from metadata map.
-     * 
-     * On x86_64: instruction pointer is in RIP (via PT_REGS_IP macro)
-     * On ARM64: instruction pointer is in PC (via PT_REGS_PC macro)
-     */
+    /* Get runtime instruction pointer and look up func_id */
     __u64 ip = PT_REGS_IP(ctx);
-    bpf_printk("uprobe fired: ip=0x%llx", ip);  // ADD THIS
-
-    /* Look up func_id from metadata map using the offset */
     __u32 *func_id_ptr = bpf_map_lookup_elem(&uprobe_metadata, &ip);
     if (!func_id_ptr) return 0;
     __u32 func_id = *func_id_ptr;
@@ -96,19 +87,25 @@ int generic_entry(struct pt_regs *ctx)
     /* Capture user stack trace */
     __s32 stack_id = bpf_get_stackid(ctx, &user_stacks, BPF_F_USER_STACK);
 
-    /* Record entry */
+    /* Record entry timestamp */
     struct func_entry entry = {};
-    entry.entry_ts = bpf_ktime_get_ns();
-    entry.func_id = func_id;
+    entry.entry_ts      = bpf_ktime_get_ns();
+    entry.func_id       = func_id;
     entry.user_stack_id = stack_id;
+    bpf_map_update_elem(&func_entries, &tid, &entry, BPF_ANY);
 
-    /* Reset off-CPU counter for this entry */
+    /* Reset ALL off-CPU counters for this new invocation */
     struct off_cpu_val reset = {};
-    reset.start_ns = 0;
+    reset.start_ns        = 0;
     reset.total_off_cpu_ns = 0;
+    reset.total_io_ns     = 0;
+    reset.total_lock_ns   = 0;
+    reset.total_sleep_ns  = 0;
+    reset.io_start_ns     = 0;
+    reset.lock_start_ns   = 0;
+    reset.sleep_start_ns  = 0;
     bpf_map_update_elem(&off_cpu_data, &tid, &reset, BPF_ANY);
 
-    bpf_map_update_elem(&func_entries, &tid, &entry, BPF_ANY);
     return 0;
 }
 
@@ -119,7 +116,7 @@ int generic_exit(struct pt_regs *ctx)
     __u32 key = 0;
     __u32 *tpid = bpf_map_lookup_elem(&target_pid, &key);
     if (!tpid || *tpid == 0) return 0;
-    
+
     __u64 pid_tgid = bpf_get_current_pid_tgid();
     __u32 pid = pid_tgid >> 32;
     __u32 tid = (__u32)pid_tgid;
@@ -129,32 +126,45 @@ int generic_exit(struct pt_regs *ctx)
     struct func_entry *fe = bpf_map_lookup_elem(&func_entries, &tid);
     if (!fe) return 0;
 
-    __u32 func_id = fe->func_id;
-    __u64 exit_ts = bpf_ktime_get_ns();
+    __u32 func_id  = fe->func_id;
+    __u64 exit_ts  = bpf_ktime_get_ns();
     __u64 total_ns = exit_ts - fe->entry_ts;
     __s32 stack_id = fe->user_stack_id;
 
-    /* Calculate timing */
+    /* Read all off-CPU reason breakdown fields */
     __u64 off_cpu_ns = 0;
+    __u64 io_ns      = 0;
+    __u64 lock_ns    = 0;
+    __u64 sleep_ns   = 0;
+
     struct off_cpu_val *oval = bpf_map_lookup_elem(&off_cpu_data, &tid);
-    if (oval) off_cpu_ns = oval->total_off_cpu_ns;
+    if (oval) {
+        off_cpu_ns = oval->total_off_cpu_ns;
+        io_ns      = oval->total_io_ns;
+        lock_ns    = oval->total_lock_ns;
+        sleep_ns   = oval->total_sleep_ns;
+    }
 
     __u64 on_cpu_ns = (off_cpu_ns < total_ns) ? (total_ns - off_cpu_ns) : 0;
 
-    /* Emit event */
+    /* Emit event to ring buffer */
     struct profiler_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
     if (e) {
-        e->pid = pid;
-        e->tid = tid;
-        e->func_id = func_id;
-        e->type = EVENT_FUNC_EXIT;
-        e->timestamp_ns = exit_ts;
-        e->duration_ns = total_ns;
-        e->on_cpu_ns = on_cpu_ns;
-        e->off_cpu_ns = off_cpu_ns;
-        e->cpu = bpf_get_smp_processor_id();
-        e->user_stack_id = stack_id;
+        e->pid             = pid;
+        e->tid             = tid;
+        e->func_id         = func_id;
+        e->type            = EVENT_FUNC_EXIT;
+        e->timestamp_ns    = exit_ts;
+        e->duration_ns     = total_ns;
+        e->on_cpu_ns       = on_cpu_ns;
+        e->off_cpu_ns      = off_cpu_ns;
+        e->io_ns           = io_ns;
+        e->lock_ns         = lock_ns;
+        e->sleep_ns        = sleep_ns;
+        e->cpu             = bpf_get_smp_processor_id();
+        e->user_stack_id   = stack_id;
         e->kernel_stack_id = -1;
+        e->pad             = 0;
         bpf_ringbuf_submit(e, 0);
     }
 

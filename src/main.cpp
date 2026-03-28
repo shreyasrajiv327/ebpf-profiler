@@ -1,8 +1,8 @@
 /*
- * main.cpp - Phase 3: auto PID resolution + dynamic unlimited functions
+ * main.cpp - Phase 4: off-CPU reason classification
  *
- * Uses metadata map for function tracking (works on any kernel 5.15+)
- * Supports unlimited functions for any target application (Redis, etc.)
+ * Adds I/O wait, lock contention, and sleep detection
+ * on top of Phase 3 (auto PID + dynamic unlimited functions)
  */
 
 #include <cstdio>
@@ -51,6 +51,9 @@ struct FuncStats {
     uint64_t total_on_cpu_ns  = 0;
     uint64_t total_off_cpu_ns = 0;
     uint64_t total_wall_ns    = 0;
+    uint64_t total_io_ns      = 0;   /* time waiting for block I/O */
+    uint64_t total_lock_ns    = 0;   /* time waiting for locks     */
+    uint64_t total_sleep_ns   = 0;   /* time in sleep calls        */
     uint64_t call_count       = 0;
 };
 static std::unordered_map<uint32_t, FuncStats> g_stats;
@@ -128,11 +131,6 @@ static std::string resolve_binary_path(uint32_t pid)
 
 /* ═══════════════════════════════════════════════════════════════════════
  *  Get runtime load base from /proc/<pid>/maps
- *
- *  For PIE binaries the kernel loads the executable at a random base
- *  address.  PT_REGS_IP in the BPF program returns the *runtime* VA,
- *  so the metadata map key must be (load_base + elf_offset), not the
- *  raw ELF offset.
  * ═════════════════════════════════════════════════════════════════════*/
 
 static uint64_t get_load_base(uint32_t pid, const std::string &binary_path)
@@ -148,7 +146,6 @@ static uint64_t get_load_base(uint32_t pid, const std::string &binary_path)
     uint64_t base = 0;
     char line[512];
     while (fgets(line, sizeof(line), f)) {
-        /* We want the first r-xp (executable) mapping of the binary */
         if (strstr(line, binary_path.c_str()) && strstr(line, "r-xp")) {
             sscanf(line, "%lx-", &base);
             break;
@@ -239,6 +236,9 @@ static int handle_event(void *, void *data, size_t)
         s.total_on_cpu_ns  += e->on_cpu_ns;
         s.total_off_cpu_ns += e->off_cpu_ns;
         s.total_wall_ns    += e->duration_ns;
+        s.total_io_ns      += e->io_ns;
+        s.total_lock_ns    += e->lock_ns;
+        s.total_sleep_ns   += e->sleep_ns;
         s.call_count++;
 
         const std::string &fname =
@@ -246,11 +246,15 @@ static int handle_event(void *, void *data, size_t)
                 ? g_func_names[e->func_id] : "unknown";
 
         printf("\n[FUNC EXIT] %s  pid=%u tid=%u\n"
-               "  wall=%.3f ms  on_cpu=%.3f ms  off_cpu=%.3f ms\n",
+               "  wall=%.3f ms  on_cpu=%.3f ms  off_cpu=%.3f ms\n"
+               "  io=%.3f ms  lock=%.3f ms  sleep=%.3f ms\n",
                fname.c_str(), e->pid, e->tid,
                e->duration_ns / 1e6,
                e->on_cpu_ns   / 1e6,
-               e->off_cpu_ns  / 1e6);
+               e->off_cpu_ns  / 1e6,
+               e->io_ns       / 1e6,
+               e->lock_ns     / 1e6,
+               e->sleep_ns    / 1e6);
 
         if (g_folded_out.is_open()) {
             g_folded_out << fname << " " << e->on_cpu_ns << "\n";
@@ -274,28 +278,33 @@ static void print_table()
     printf("\033[2J\033[H");
     printf("eBPF Profiler — uprobe + off-cpu  |  pid=%u  bin=%s\n",
            g_target_pid, g_binary_path.c_str());
-    printf("%s\n", std::string(84, '=').c_str());
-    printf("%-24s %8s %13s %13s %11s\n",
-           "FUNCTION", "CALLS", "ON_CPU_MS", "OFF_CPU_MS", "WALL_MS");
-    printf("%s\n", std::string(84, '-').c_str());
+    printf("%s\n", std::string(110, '=').c_str());
+    printf("%-24s %8s %12s %12s %11s %10s %10s %10s\n",
+           "FUNCTION", "CALLS", "ON_CPU_MS", "OFF_CPU_MS",
+           "WALL_MS", "IO_MS", "LOCK_MS", "SLEEP_MS");
+    printf("%s\n", std::string(110, '-').c_str());
 
     for (size_t i = 0; i < g_func_names.size(); i++) {
         auto it = g_stats.find((uint32_t)i);
         if (it == g_stats.end()) {
-            printf("%-24s %8s %13s %13s %11s\n",
-                   g_func_names[i].c_str(), "0", "0.000", "0.000", "0.000");
+            printf("%-24s %8s %12s %12s %11s %10s %10s %10s\n",
+                   g_func_names[i].c_str(),
+                   "0", "0.000", "0.000", "0.000", "0.000", "0.000", "0.000");
             continue;
         }
         const auto &s = it->second;
-        printf("%-24s %8llu %13.3f %13.3f %11.3f\n",
+        printf("%-24s %8llu %12.3f %12.3f %11.3f %10.3f %10.3f %10.3f\n",
                g_func_names[i].c_str(),
                (unsigned long long)s.call_count,
                s.total_on_cpu_ns  / 1e6,
                s.total_off_cpu_ns / 1e6,
-               s.total_wall_ns    / 1e6);
+               s.total_wall_ns    / 1e6,
+               s.total_io_ns      / 1e6,
+               s.total_lock_ns    / 1e6,
+               s.total_sleep_ns   / 1e6);
     }
 
-    printf("%s\n", std::string(84, '-').c_str());
+    printf("%s\n", std::string(110, '-').c_str());
     printf("Off-CPU blocking events : %llu\n",
            (unsigned long long)g_off_cpu_events);
     printf("Folded stacks           : stacks.folded\n");
@@ -335,13 +344,13 @@ static void usage(const char *prog)
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
- *  libbpf print callback (errors + warnings only)
+ *  libbpf print callback
  * ═════════════════════════════════════════════════════════════════════*/
 
 static int libbpf_print(enum libbpf_print_level level,
                         const char *fmt, va_list args)
 {
-    if (level == LIBBPF_DEBUG) return 0;   /* suppress verbose debug spam */
+    if (level == LIBBPF_DEBUG) return 0;
     return vfprintf(stderr, fmt, args);
 }
 
@@ -471,7 +480,7 @@ int main(int argc, char **argv)
     if (set_target_pid(g_uprobe_obj, g_target_pid) != 0) { cleanup(); return 1; }
     if (set_target_pid(g_offcpu_obj, g_target_pid) != 0) { cleanup(); return 1; }
 
-    /* ── Resolve PIE load base ─────────────────────────────────────── */
+    /* Resolve PIE load base */
     uint64_t load_base = get_load_base(g_target_pid, g_binary_path);
     if (load_base == 0) {
         fprintf(stderr, "ERROR: could not determine binary load base for PID %u\n",
@@ -515,11 +524,6 @@ int main(int argc, char **argv)
                (unsigned long long)(load_base + offset));
         fflush(stdout);
 
-        /*
-         * Store metadata key as the RUNTIME address (load_base + elf_offset).
-         * PT_REGS_IP in the BPF program returns the runtime VA, so the key
-         * must match that — not the raw ELF offset.
-         */
         uint64_t runtime_addr = load_base + offset;
         uint32_t func_id = (uint32_t)i;
         if (bpf_map_update_elem(metadata_fd, &runtime_addr, &func_id, BPF_ANY) != 0) {
@@ -527,25 +531,23 @@ int main(int argc, char **argv)
             continue;
         }
 
-        /* Attach entry probe — libbpf takes the ELF offset, not runtime addr */
         struct bpf_link *el = bpf_program__attach_uprobe(generic_entry, false,
                                              (int)g_target_pid,
                                              g_binary_path.c_str(), offset);
-
-        /* Attach exit probe */
         struct bpf_link *xl = bpf_program__attach_uprobe(generic_exit, true,
                                              (int)g_target_pid,
                                              g_binary_path.c_str(), offset);
 
-        if (!el || !xl) {
+        if (!el || !xl)
             printf("FAILED (attach: %s)\n", strerror(errno));
-        } else {
+        else
             printf("OK\n");
-        }
     }
 
     /* Attach off-CPU tracepoint */
-    printf("\n[*] Attaching off-cpu tracepoint...\n");
+    printf("\n[*] Attaching off-cpu tracepoints...\n");
+
+    /* sched_switch — main off-CPU detector */
     struct bpf_program *offcpu_prog =
         bpf_object__find_program_by_name(g_offcpu_obj, "off_cpu_sched_switch");
     if (!offcpu_prog) {
@@ -558,6 +560,54 @@ int main(int argc, char **argv)
         cleanup(); return 1;
     }
     printf("[+] OK: sched/sched_switch\n");
+
+    /* block I/O start */
+    struct bpf_program *io_start_prog =
+        bpf_object__find_program_by_name(g_offcpu_obj, "io_start");
+    if (io_start_prog) {
+        struct bpf_link *l = bpf_program__attach(io_start_prog);
+        printf("[+] %s: block/block_rq_insert\n", l ? "OK" : "FAILED");
+    }
+
+    /* block I/O end */
+    struct bpf_program *io_end_prog =
+        bpf_object__find_program_by_name(g_offcpu_obj, "io_end");
+    if (io_end_prog) {
+        struct bpf_link *l = bpf_program__attach(io_end_prog);
+        printf("[+] %s: block/block_rq_complete\n", l ? "OK" : "FAILED");
+    }
+
+    /* lock contention start */
+    struct bpf_program *lock_start_prog =
+        bpf_object__find_program_by_name(g_offcpu_obj, "lock_start");
+    if (lock_start_prog) {
+        struct bpf_link *l = bpf_program__attach(lock_start_prog);
+        printf("[+] %s: lock/contention_begin\n", l ? "OK" : "FAILED");
+    }
+
+    /* lock contention end */
+    struct bpf_program *lock_end_prog =
+        bpf_object__find_program_by_name(g_offcpu_obj, "lock_end");
+    if (lock_end_prog) {
+        struct bpf_link *l = bpf_program__attach(lock_end_prog);
+        printf("[+] %s: lock/contention_end\n", l ? "OK" : "FAILED");
+    }
+
+    /* sleep start */
+    struct bpf_program *sleep_start_prog =
+        bpf_object__find_program_by_name(g_offcpu_obj, "sleep_start");
+    if (sleep_start_prog) {
+        struct bpf_link *l = bpf_program__attach(sleep_start_prog);
+        printf("[+] %s: syscalls/sys_enter_nanosleep\n", l ? "OK" : "FAILED");
+    }
+
+    /* sleep end */
+    struct bpf_program *sleep_end_prog =
+        bpf_object__find_program_by_name(g_offcpu_obj, "sleep_end");
+    if (sleep_end_prog) {
+        struct bpf_link *l = bpf_program__attach(sleep_end_prog);
+        printf("[+] %s: syscalls/sys_exit_epoll_pwait\n", l ? "OK" : "FAILED");
+    }
 
     /* Setup ring buffers */
     struct bpf_map *urb = bpf_object__find_map_by_name(g_uprobe_obj, "events");

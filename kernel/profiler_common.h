@@ -5,28 +5,36 @@
 #define FUNC_NAME_LEN    64
 
 enum event_type {
-    EVENT_FUNC_ENTRY  = 1,   /* uprobe: function entered */
-    EVENT_FUNC_EXIT   = 2,   /* uprobe: function exited  */
-    EVENT_OFF_CPU     = 3,   /* kprobe: thread blocked   */
-    EVENT_ON_CPU      = 4,   /* perf_event: on-cpu sample */
+    EVENT_FUNC_ENTRY  = 1,
+    EVENT_FUNC_EXIT   = 2,
+    EVENT_OFF_CPU     = 3,
+    EVENT_ON_CPU      = 4,
+    EVENT_IO_START    = 5,
+    EVENT_IO_END      = 6,
+    EVENT_LOCK_START  = 7,
+    EVENT_LOCK_END    = 8,
+    EVENT_SLEEP_START = 9,
+    EVENT_SLEEP_END   = 10,
 };
 
 struct profiler_event {
     __u32 pid;
     __u32 tid;
-    __u32 func_id;           /* index into function list userspace gave us */
-    __u32 type;              /* enum event_type */
-    __u64 timestamp_ns;      /* ktime_get_ns() at event time */
-    __u64 duration_ns;       /* EXIT: total wall time, OFF_CPU: block duration */
-    __u64 on_cpu_ns;         /* EXIT only: wall time minus off-cpu time */
-    __u64 off_cpu_ns;        /* EXIT only: total time spent blocked */
+    __u32 func_id;
+    __u32 type;
+    __u64 timestamp_ns;
+    __u64 duration_ns;
+    __u64 on_cpu_ns;
+    __u64 off_cpu_ns;
+    /* breakdown of off-cpu reason */
+    __u64 io_ns;           /* NEW */
+    __u64 lock_ns;         /* NEW */
+    __u64 sleep_ns;        /* NEW */
     __u32 cpu;
     __u32 pad;
-    /* Stack trace IDs — negative value means unavailable */
-    __s32 user_stack_id;     /* index into user_stacks map   */
-    __s32 kernel_stack_id;   /* index into kernel_stacks map */
+    __s32 user_stack_id;
+    __s32 kernel_stack_id;
 };
-
 /*
  * Shared between off_cpu.bpf.c and uprobe.bpf.c:
  * tracks when a thread went off-CPU and for how long
@@ -34,6 +42,14 @@ struct profiler_event {
 struct off_cpu_val {
     __u64 start_ns;
     __u64 total_off_cpu_ns;
+    /* off-CPU reason breakdown */
+    __u64 total_io_ns;        /* time waiting for block I/O */
+    __u64 total_lock_ns;      /* time waiting for locks */
+    __u64 total_sleep_ns;     /* time in sleep/nanosleep */
+    /* per-reason start timestamps */
+    __u64 io_start_ns;
+    __u64 lock_start_ns;
+    __u64 sleep_start_ns;
 };
 
 /*
