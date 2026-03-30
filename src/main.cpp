@@ -1,8 +1,11 @@
 /*
- * main.cpp - Phase 4: off-CPU reason classification
+ * main.cpp - V2: Userspace derivation + metrics
  *
- * Adds I/O wait, lock contention, and sleep detection
- * on top of Phase 3 (auto PID + dynamic unlimited functions)
+ * CHANGES:
+ * - Integrated DerivationEngine
+ * - Updated event handler to route events by type
+ * - Removed old g_stats accumulation
+ * - Handle both profiler_event and off_cpu_event
  */
 
 #include <cstdio>
@@ -31,6 +34,8 @@
 #include <libelf.h>
 
 #include "profiler_common.h"
+#include "types.hpp"
+#include "derivation.hpp"
 
 /* ═══════════════════════════════════════════════════════════════════════
  *  Globals
@@ -42,25 +47,24 @@ static struct bpf_object  *g_uprobe_obj = nullptr;
 static struct bpf_object  *g_offcpu_obj = nullptr;
 static struct ring_buffer *g_uprobe_rb  = nullptr;
 static struct ring_buffer *g_offcpu_rb  = nullptr;
+static struct bpf_object *g_oncpu_obj = nullptr;
+static struct ring_buffer *g_oncpu_rb = nullptr;
 
 static std::vector<std::string> g_func_names;
 static uint32_t  g_target_pid = 0;
 static std::string g_binary_path;
 
-struct FuncStats {
-    uint64_t total_on_cpu_ns  = 0;
-    uint64_t total_off_cpu_ns = 0;
-    uint64_t total_wall_ns    = 0;
-    uint64_t total_io_ns      = 0;   /* time waiting for block I/O */
-    uint64_t total_lock_ns    = 0;   /* time waiting for locks     */
-    uint64_t total_sleep_ns   = 0;   /* time in sleep calls        */
-    uint64_t call_count       = 0;
-};
-static std::unordered_map<uint32_t, FuncStats> g_stats;
-static uint64_t g_off_cpu_events = 0;
+/* V2: Derivation engine replaces g_stats */
+static DerivationEngine *g_derivation = nullptr;
 
 /* Folded-stacks output file */
 static std::ofstream g_folded_out;
+
+/* Statistics */
+static uint64_t g_total_func_entries = 0;
+static uint64_t g_total_func_exits = 0;
+static uint64_t g_total_off_cpu_events = 0;
+static uint64_t g_total_on_cpu_samples = 0;
 
 /* ═══════════════════════════════════════════════════════════════════════
  *  Signal handler
@@ -223,49 +227,88 @@ static uint64_t find_symbol_offset(const char *binary, const char *sym_name)
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
- *  Ring buffer callback
+ *  Derivation callback - receives derived metrics
  * ═════════════════════════════════════════════════════════════════════*/
 
-static int handle_event(void *, void *data, size_t)
+static void on_derived_metrics(const DerivedFunctionMetrics& metrics)
 {
-    const struct profiler_event *e =
-        reinterpret_cast<const struct profiler_event *>(data);
+    static uint64_t call_count = 0;
+    call_count++;
 
-    if (e->type == EVENT_FUNC_EXIT) {
-        auto &s = g_stats[e->func_id];
-        s.total_on_cpu_ns  += e->on_cpu_ns;
-        s.total_off_cpu_ns += e->off_cpu_ns;
-        s.total_wall_ns    += e->duration_ns;
-        s.total_io_ns      += e->io_ns;
-        s.total_lock_ns    += e->lock_ns;
-        s.total_sleep_ns   += e->sleep_ns;
-        s.call_count++;
+    const std::string &fname =
+        (metrics.func_id < g_func_names.size())
+            ? g_func_names[metrics.func_id] : "unknown_func";
 
-        const std::string &fname =
-            (e->func_id < g_func_names.size())
-                ? g_func_names[e->func_id] : "unknown";
+    printf("[DERIVED #%llu] %s  wall=%.3f ms (%.0f µs)  on=%.3f ms  off=%.3f ms  eff=%.1f%%  block=%.2fx\n"
+           "                 io=%.3f  lock=%.3f  sleep=%.3f  sched=%.3f ms\n\n",
+           (unsigned long long)call_count, fname.c_str(),
+           metrics.wall_time_ns / 1e6,
+           metrics.wall_time_ns / 1000.0,           // µs
+           metrics.on_cpu_ns / 1e6,
+           metrics.off_cpu_total_ns / 1e6,
+           metrics.cpu_efficiency * 100.0,
+           metrics.blocking_ratio,
+           metrics.io_wait_ns / 1e6,
+           metrics.lock_contention_ns / 1e6,
+           metrics.sleep_ns / 1e6,
+           metrics.scheduler_ns / 1e6);
+}
 
-        printf("\n[FUNC EXIT] %s  pid=%u tid=%u\n"
-               "  wall=%.3f ms  on_cpu=%.3f ms  off_cpu=%.3f ms\n"
-               "  io=%.3f ms  lock=%.3f ms  sleep=%.3f ms\n",
-               fname.c_str(), e->pid, e->tid,
-               e->duration_ns / 1e6,
-               e->on_cpu_ns   / 1e6,
-               e->off_cpu_ns  / 1e6,
-               e->io_ns       / 1e6,
-               e->lock_ns     / 1e6,
-               e->sleep_ns    / 1e6);
+/* ═══════════════════════════════════════════════════════════════════════
+ *  Ring buffer callback - V2: Route events to derivation engine
+ * ═════════════════════════════════════════════════════════════════════*/
 
-        if (g_folded_out.is_open()) {
-            g_folded_out << fname << " " << e->on_cpu_ns << "\n";
-        }
-
-    } else if (e->type == EVENT_OFF_CPU) {
-        g_off_cpu_events++;
-        printf("[OFF_CPU] pid=%u tid=%u  blocked=%.3f ms\n",
-               e->pid, e->tid, e->duration_ns / 1e6);
+static int handle_event(void *ctx, void *data, size_t data_sz)
+{
+    if (data_sz < 13) {
+        fprintf(stderr, "Event too small: %zu bytes\n", data_sz);
+        return 0;
     }
 
+    const uint8_t* bytes = static_cast<const uint8_t*>(data);
+
+    /* Try profiler_event first (type byte is always at offset 12) */
+    uint8_t type_profiler = bytes[12];
+    if (type_profiler == EVENT_FUNC_ENTRY ||
+        type_profiler == EVENT_FUNC_EXIT ||
+        type_profiler == EVENT_ON_CPU) {
+
+        if (data_sz < sizeof(profiler_event)) {
+            fprintf(stderr, "profiler_event truncated (%zu < %zu)\n", data_sz, sizeof(profiler_event));
+            return 0;
+        }
+
+        const profiler_event *evt = reinterpret_cast<const profiler_event*>(data);
+        switch (evt->type) {
+        case EVENT_FUNC_ENTRY:
+            g_total_func_entries++;
+            g_derivation->process_function_entry(*evt);
+            break;
+        case EVENT_FUNC_EXIT:
+            g_total_func_exits++;
+            g_derivation->process_function_exit(*evt);
+            break;
+        case EVENT_ON_CPU:
+            g_total_on_cpu_samples++;
+            g_derivation->process_on_cpu_sample(*evt);
+            break;
+        }
+        return 0;
+    }
+
+    /* Try off_cpu_event (type byte is at offset 24) */
+    if (data_sz >= sizeof(off_cpu_event) && bytes[24] == EVENT_OFF_CPU) {
+        const off_cpu_event *evt = reinterpret_cast<const off_cpu_event*>(data);
+        g_total_off_cpu_events++;
+        g_derivation->process_off_cpu_event(*evt);
+        return 0;
+    }
+
+    /* Debug unknown events */
+    uint32_t pid = *reinterpret_cast<const uint32_t*>(data);
+    uint32_t tid = *reinterpret_cast<const uint32_t*>(data + 4);
+    fprintf(stderr, "Unknown event type: profiler_candidate=%u off_candidate=%u (pid=%u tid=%u data_sz=%zu)\n",
+            type_profiler, (data_sz >= 25 ? bytes[24] : 0), pid, tid, data_sz);
     return 0;
 }
 
@@ -276,38 +319,23 @@ static int handle_event(void *, void *data, size_t)
 static void print_table()
 {
     printf("\033[2J\033[H");
-    printf("eBPF Profiler — uprobe + off-cpu  |  pid=%u  bin=%s\n",
+    printf("eBPF Profiler V2 — Userspace Derivation  |  pid=%u  bin=%s\n",
            g_target_pid, g_binary_path.c_str());
-    printf("%s\n", std::string(110, '=').c_str());
-    printf("%-24s %8s %12s %12s %11s %10s %10s %10s\n",
-           "FUNCTION", "CALLS", "ON_CPU_MS", "OFF_CPU_MS",
-           "WALL_MS", "IO_MS", "LOCK_MS", "SLEEP_MS");
-    printf("%s\n", std::string(110, '-').c_str());
-
-    for (size_t i = 0; i < g_func_names.size(); i++) {
-        auto it = g_stats.find((uint32_t)i);
-        if (it == g_stats.end()) {
-            printf("%-24s %8s %12s %12s %11s %10s %10s %10s\n",
-                   g_func_names[i].c_str(),
-                   "0", "0.000", "0.000", "0.000", "0.000", "0.000", "0.000");
-            continue;
-        }
-        const auto &s = it->second;
-        printf("%-24s %8llu %12.3f %12.3f %11.3f %10.3f %10.3f %10.3f\n",
-               g_func_names[i].c_str(),
-               (unsigned long long)s.call_count,
-               s.total_on_cpu_ns  / 1e6,
-               s.total_off_cpu_ns / 1e6,
-               s.total_wall_ns    / 1e6,
-               s.total_io_ns      / 1e6,
-               s.total_lock_ns    / 1e6,
-               s.total_sleep_ns   / 1e6);
-    }
-
-    printf("%s\n", std::string(110, '-').c_str());
-    printf("Off-CPU blocking events : %llu\n",
-           (unsigned long long)g_off_cpu_events);
-    printf("Folded stacks           : stacks.folded\n");
+    printf("%s\n", std::string(90, '=').c_str());
+    printf("Event Statistics:\n");
+    printf("  Function entries : %llu\n", (unsigned long long)g_total_func_entries);
+    printf("  Function exits   : %llu\n", (unsigned long long)g_total_func_exits);
+    printf("  Off-CPU events   : %llu\n", (unsigned long long)g_total_off_cpu_events);
+    printf("  On-CPU samples   : %llu\n", (unsigned long long)g_total_on_cpu_samples);
+    printf("\n");
+    printf("Derivation Engine:\n");
+    printf("  Total processed  : %llu\n", 
+           (unsigned long long)g_derivation->get_total_processed());
+    printf("  Dropped (short)  : %llu\n", 
+           (unsigned long long)g_derivation->get_dropped_short_calls());
+    printf("  Errors           : %llu\n", 
+           (unsigned long long)g_derivation->get_error_count());
+    printf("%s\n", std::string(90, '-').c_str());
     printf("Press Ctrl-C to stop\n");
     fflush(stdout);
 }
@@ -318,11 +346,16 @@ static void print_table()
 
 static void cleanup()
 {
+    if (g_derivation) {
+        delete g_derivation;
+        g_derivation = nullptr;
+    }
     if (g_uprobe_rb)  ring_buffer__free(g_uprobe_rb);
     if (g_offcpu_rb)  ring_buffer__free(g_offcpu_rb);
+    if (g_oncpu_rb) ring_buffer__free(g_oncpu_rb);
+    if (g_oncpu_obj) bpf_object__close(g_oncpu_obj);
     if (g_uprobe_obj) bpf_object__close(g_uprobe_obj);
     if (g_offcpu_obj) bpf_object__close(g_offcpu_obj);
-    unlink("/sys/fs/bpf/profiler_off_cpu_data");
     if (g_folded_out.is_open()) g_folded_out.close();
 }
 
@@ -400,9 +433,16 @@ int main(int argc, char **argv)
     g_binary_path = resolve_binary_path(g_target_pid);
     if (g_binary_path.empty()) {
         fprintf(stderr, "Error: could not resolve binary path for PID %u\n", g_target_pid);
-        return 1;
+        cleanup(); return 1;
     }
-    printf("[+] Binary  : %s\n", g_binary_path.c_str());
+    printf("[+] Binary : %s\n", g_binary_path.c_str());
+
+    /* Quick sanity check - Redis often shows as redis-server or redis-check-rdb */
+    std::string basename = g_binary_path.substr(g_binary_path.find_last_of('/') + 1);
+    if (basename != process_name && basename != "redis-server") {
+        printf("[!] Warning: resolved binary is '%s' (expected something with '%s')\n",
+            basename.c_str(), process_name.c_str());
+    }
 
     /* Parse function list */
     {
@@ -426,12 +466,17 @@ int main(int argc, char **argv)
     g_folded_out.open("stacks.folded", std::ios::app);
     if (g_folded_out.is_open()) printf("[+] Folded stacks → stacks.folded\n\n");
 
+    /* V2: Initialize derivation engine */
+    printf("[*] Initializing derivation engine...\n");
+    g_derivation = new DerivationEngine(on_derived_metrics);
+    g_derivation->set_min_duration_ns(0);     // Keep this
+    g_derivation->set_min_off_cpu_ns(500);
+    printf("[+] Derivation engine ready\n\n");
+
     signal(SIGINT,  sig_handler);
     signal(SIGTERM, sig_handler);
     bump_memlock_rlimit();
     libbpf_set_print(libbpf_print);
-
-    unlink("/sys/fs/bpf/profiler_off_cpu_data");
 
     /* Load off_cpu BPF object */
     printf("[*] Loading %s ...\n", offcpu_obj_path);
@@ -446,13 +491,23 @@ int main(int argc, char **argv)
     }
     printf("[+] Loaded OK\n");
 
-    struct bpf_map *shared_map = bpf_object__find_map_by_name(g_offcpu_obj, "off_cpu_data");
-    if (!shared_map) { fprintf(stderr, "off_cpu_data map not found\n"); cleanup(); return 1; }
-    if (bpf_map__pin(shared_map, "/sys/fs/bpf/profiler_off_cpu_data") != 0) {
-        fprintf(stderr, "Failed to pin off_cpu_data: %s\n", strerror(errno));
+    /* === Load on_cpu BPF object === */
+    printf("[*] Loading on_cpu.bpf.o ...\n");
+    const char *oncpu_obj_path = "./on_cpu.bpf.o";
+    g_oncpu_obj = bpf_object__open_file(oncpu_obj_path, nullptr);
+    if (libbpf_get_error(g_oncpu_obj)) {
+        fprintf(stderr, "Failed to open on_cpu BPF object\n");
         cleanup(); return 1;
     }
-    printf("[+] Pinned off_cpu_data map\n");
+    if (bpf_object__load(g_oncpu_obj) != 0) {
+        fprintf(stderr, "Failed to load on_cpu BPF object: %s\n", strerror(errno));
+        cleanup(); return 1;
+    }
+    printf("[+] Loaded on_cpu.bpf.o OK\n");
+
+    if (set_target_pid(g_oncpu_obj, g_target_pid) != 0) {
+        cleanup(); return 1;
+    }
 
     /* Load uprobe BPF object */
     printf("[*] Loading %s ...\n", uprobe_obj_path);
@@ -460,15 +515,6 @@ int main(int argc, char **argv)
     if (libbpf_get_error(g_uprobe_obj)) {
         fprintf(stderr, "Failed to open uprobe BPF object\n");
         cleanup(); return 1;
-    }
-
-    struct bpf_map *uprobe_shared = bpf_object__find_map_by_name(g_uprobe_obj, "off_cpu_data");
-    if (uprobe_shared) {
-        int pinned_fd = bpf_obj_get("/sys/fs/bpf/profiler_off_cpu_data");
-        if (pinned_fd >= 0) {
-            bpf_map__reuse_fd(uprobe_shared, pinned_fd);
-            printf("[+] Reusing shared off_cpu_data map\n");
-        }
     }
 
     if (bpf_object__load(g_uprobe_obj) != 0) {
@@ -544,10 +590,9 @@ int main(int argc, char **argv)
             printf("OK\n");
     }
 
-    /* Attach off-CPU tracepoint */
+    /* Attach off-CPU tracepoints */
     printf("\n[*] Attaching off-cpu tracepoints...\n");
 
-    /* sched_switch — main off-CPU detector */
     struct bpf_program *offcpu_prog =
         bpf_object__find_program_by_name(g_offcpu_obj, "off_cpu_sched_switch");
     if (!offcpu_prog) {
@@ -561,7 +606,6 @@ int main(int argc, char **argv)
     }
     printf("[+] OK: sched/sched_switch\n");
 
-    /* block I/O start */
     struct bpf_program *io_start_prog =
         bpf_object__find_program_by_name(g_offcpu_obj, "io_start");
     if (io_start_prog) {
@@ -569,7 +613,6 @@ int main(int argc, char **argv)
         printf("[+] %s: block/block_rq_insert\n", l ? "OK" : "FAILED");
     }
 
-    /* block I/O end */
     struct bpf_program *io_end_prog =
         bpf_object__find_program_by_name(g_offcpu_obj, "io_end");
     if (io_end_prog) {
@@ -577,7 +620,6 @@ int main(int argc, char **argv)
         printf("[+] %s: block/block_rq_complete\n", l ? "OK" : "FAILED");
     }
 
-    /* lock contention start */
     struct bpf_program *lock_start_prog =
         bpf_object__find_program_by_name(g_offcpu_obj, "lock_start");
     if (lock_start_prog) {
@@ -585,7 +627,6 @@ int main(int argc, char **argv)
         printf("[+] %s: lock/contention_begin\n", l ? "OK" : "FAILED");
     }
 
-    /* lock contention end */
     struct bpf_program *lock_end_prog =
         bpf_object__find_program_by_name(g_offcpu_obj, "lock_end");
     if (lock_end_prog) {
@@ -593,15 +634,13 @@ int main(int argc, char **argv)
         printf("[+] %s: lock/contention_end\n", l ? "OK" : "FAILED");
     }
 
-    /* sleep start */
     struct bpf_program *sleep_start_prog =
         bpf_object__find_program_by_name(g_offcpu_obj, "sleep_start");
     if (sleep_start_prog) {
         struct bpf_link *l = bpf_program__attach(sleep_start_prog);
-        printf("[+] %s: syscalls/sys_enter_nanosleep\n", l ? "OK" : "FAILED");
+        printf("[+] %s: syscalls/sys_enter_epoll_pwait\n", l ? "OK" : "FAILED");
     }
 
-    /* sleep end */
     struct bpf_program *sleep_end_prog =
         bpf_object__find_program_by_name(g_offcpu_obj, "sleep_end");
     if (sleep_end_prog) {
@@ -609,22 +648,63 @@ int main(int argc, char **argv)
         printf("[+] %s: syscalls/sys_exit_epoll_pwait\n", l ? "OK" : "FAILED");
     }
 
+    /* === Attach on-CPU profiler (perf_event sampling) === */
+    printf("\n[*] Attaching on-CPU profiler (perf_event sampling ~500Hz)...\n");
+    struct bpf_program *oncpu_prog =
+        bpf_object__find_program_by_name(g_oncpu_obj, "on_cpu_sample");
+    if (!oncpu_prog) {
+        fprintf(stderr, "on_cpu_sample program not found\n");
+        cleanup(); return 1;
+    }
+
+    int nr_cpus = libbpf_num_possible_cpus();
+    struct bpf_link *oncpu_links[128] = {nullptr};
+    bool attached = false;
+
+    struct perf_event_attr pea = {};
+    pea.type          = PERF_TYPE_SOFTWARE;
+    pea.config        = PERF_COUNT_SW_CPU_CLOCK;
+    pea.sample_period = 2000000ULL;     // ~500 Hz
+    pea.wakeup_events = 1;
+
+    for (int cpu = 0; cpu < nr_cpus && cpu < 128; cpu++) {
+        int pfd = syscall(__NR_perf_event_open, &pea, g_target_pid, cpu, -1, 0);
+        if (pfd < 0) continue;
+
+        struct bpf_link *link = bpf_program__attach_perf_event(oncpu_prog, pfd);
+        if (link) {
+            oncpu_links[cpu] = link;
+            attached = true;
+        } else {
+            close(pfd);
+        }
+    }
+
+    if (!attached) {
+        fprintf(stderr, "Failed to attach on-CPU sampling on any CPU\n");
+        cleanup(); return 1;
+    }
+    printf("[+] OK: on-CPU sampling attached (~500 Hz on %d CPUs)\n", nr_cpus);
+
     /* Setup ring buffers */
     struct bpf_map *urb = bpf_object__find_map_by_name(g_uprobe_obj, "events");
     struct bpf_map *orb = bpf_object__find_map_by_name(g_offcpu_obj, "events");
+    struct bpf_map *onrb = bpf_object__find_map_by_name(g_oncpu_obj, "rb");  // note: 'rb' in on_cpu.bpf.c
 
-    if (!urb || !orb) {
-        fprintf(stderr, "Could not find 'events' ring buffer map\n");
+    if (!urb || !orb || !onrb) {
+        fprintf(stderr, "Could not find ring buffer maps\n");
         cleanup(); return 1;
     }
 
     g_uprobe_rb = ring_buffer__new(bpf_map__fd(urb), handle_event, nullptr, nullptr);
     g_offcpu_rb = ring_buffer__new(bpf_map__fd(orb), handle_event, nullptr, nullptr);
+    g_oncpu_rb  = ring_buffer__new(bpf_map__fd(onrb), handle_event, nullptr, nullptr);
 
-    if (!g_uprobe_rb || !g_offcpu_rb) {
-        fprintf(stderr, "ring_buffer__new failed\n");
+    if (!g_uprobe_rb || !g_offcpu_rb || !g_oncpu_rb) {
+        fprintf(stderr, "ring_buffer__new failed for one of the rings\n");
         cleanup(); return 1;
     }
+    printf("[+] All ring buffers ready\n");
 
     printf("\n[+] Profiling started — table updates every second\n\n");
 
@@ -633,6 +713,7 @@ int main(int argc, char **argv)
     while (g_running) {
         ring_buffer__poll(g_uprobe_rb, 100);
         ring_buffer__poll(g_offcpu_rb, 0);
+        ring_buffer__poll(g_oncpu_rb, 0);
 
         time_t now = time(nullptr);
         if (now - last_print >= 1) {

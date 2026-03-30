@@ -80,8 +80,8 @@ int on_cpu_sample(struct bpf_perf_event_data *ctx)
         return 0;
 
     __u64 pid_tgid = bpf_get_current_pid_tgid();
-    __u32 tgid     = pid_tgid >> 32;   /* process ID */
-    __u32 tid      = (__u32)pid_tgid;  /* thread  ID */
+    __u32 tgid = pid_tgid >> 32; /* process ID */
+    __u32 tid = (__u32)pid_tgid; /* thread ID */
 
     if (tgid != *tpid)
         return 0;
@@ -93,21 +93,23 @@ int on_cpu_sample(struct bpf_perf_event_data *ctx)
         return 0;
 
     /* --- Populate event -------------------------------------------- */
-    e->pid          = tgid;
-    e->tid          = tid;
+    e->pid = tgid;
+    e->tid = tid;
     e->timestamp_ns = bpf_ktime_get_ns();
-    e->duration_ns  = 0;   /* not applicable for on-CPU samples */
-    e->type         = EVENT_ON_CPU;
+    e->type = EVENT_ON_CPU;
 
-    /*
-     * BPF_F_USER_STACK  → capture user-space  call chain
-     * 0                 → capture kernel-space call chain
-     * Returns a negative errno on failure; store as-is so userspace
-     * can detect invalid IDs (< 0).
-     */
-    e->user_stack_id   = bpf_get_stackid(ctx, &user_stacks,
-                                          BPF_F_USER_STACK);
+    /* V2 compatible fields */
+    e->func_id = 0;           /* not applicable for on-CPU samples */
+    e->entry_ts = 0;
+    e->exit_ts = 0;
+
+    /* Stack traces */
+    e->user_stack_id = bpf_get_stackid(ctx, &user_stacks, BPF_F_USER_STACK);
     e->kernel_stack_id = bpf_get_stackid(ctx, &kernel_stacks, 0);
+
+    /* Context */
+    e->cpu = bpf_get_smp_processor_id();
+    e->pad2 = 0;
 
     bpf_ringbuf_submit(e, 0);
     return 0;

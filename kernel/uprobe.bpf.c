@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * uprobe.bpf.c - Dynamic function probing via metadata map
+ * uprobe.bpf.c - V2: Raw event emission for userspace derivation
  *
- * Supports unlimited functions via metadata map approach.
- * Works on kernel 4.4+ (no cookies required).
- *
- * Userspace stores: offset → func_id mapping in uprobe_metadata map
- * Kernel reads: offset from context → func_id lookup
+ * CHANGES:
+ * - Removed on-CPU/off-CPU calculation logic
+ * - Emit raw timestamps (entry_ts, exit_ts)
+ * - Removed reads from off_cpu_data map
+ * - Simplified to just collect raw data
  */
 
 #include "vmlinux.h"
@@ -28,14 +28,6 @@ struct {
     __type(key,   __u32);
     __type(value, struct func_entry);
 } func_entries SEC(".maps");
-
-/* Shared with off_cpu.bpf.c */
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 10240);
-    __type(key,   __u32);
-    __type(value, struct off_cpu_val);
-} off_cpu_data SEC(".maps");
 
 /* Metadata: runtime address → func_id */
 struct {
@@ -65,7 +57,9 @@ struct {
     __uint(max_entries, 64 * 1024 * 1024);
 } events SEC(".maps");
 
-/* ── Generic entry handler ─────────────────────────────────────────── */
+/* ══════════════════════════════════════════════════════════════════════
+ *  Generic entry handler
+ * ════════════════════════════════════════════════════════════════════ */
 SEC("uprobe/")
 int generic_entry(struct pt_regs *ctx)
 {
@@ -87,29 +81,38 @@ int generic_entry(struct pt_regs *ctx)
     /* Capture user stack trace */
     __s32 stack_id = bpf_get_stackid(ctx, &user_stacks, BPF_F_USER_STACK);
 
+    __u64 entry_ts = bpf_ktime_get_ns();
+
     /* Record entry timestamp */
     struct func_entry entry = {};
-    entry.entry_ts      = bpf_ktime_get_ns();
+    entry.entry_ts      = entry_ts;
     entry.func_id       = func_id;
     entry.user_stack_id = stack_id;
     bpf_map_update_elem(&func_entries, &tid, &entry, BPF_ANY);
 
-    /* Reset ALL off-CPU counters for this new invocation */
-    struct off_cpu_val reset = {};
-    reset.start_ns        = 0;
-    reset.total_off_cpu_ns = 0;
-    reset.total_io_ns     = 0;
-    reset.total_lock_ns   = 0;
-    reset.total_sleep_ns  = 0;
-    reset.io_start_ns     = 0;
-    reset.lock_start_ns   = 0;
-    reset.sleep_start_ns  = 0;
-    bpf_map_update_elem(&off_cpu_data, &tid, &reset, BPF_ANY);
+    /* Optional: Emit ENTRY event for tracking */
+    struct profiler_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+    if (e) {
+        e->pid             = pid;
+        e->tid             = tid;
+        e->func_id         = func_id;
+        e->type            = EVENT_FUNC_ENTRY;
+        e->timestamp_ns    = entry_ts;
+        e->entry_ts        = entry_ts;
+        e->exit_ts         = 0;
+        e->user_stack_id   = stack_id;
+        e->kernel_stack_id = -1;
+        e->cpu             = bpf_get_smp_processor_id();
+        e->pad2            = 0;
+        bpf_ringbuf_submit(e, 0);
+    }
 
     return 0;
 }
 
-/* ── Generic exit handler ──────────────────────────────────────────── */
+/* ══════════════════════════════════════════════════════════════════════
+ *  Generic exit handler
+ * ════════════════════════════════════════════════════════════════════ */
 SEC("uretprobe/")
 int generic_exit(struct pt_regs *ctx)
 {
@@ -127,25 +130,14 @@ int generic_exit(struct pt_regs *ctx)
     if (!fe) return 0;
 
     __u32 func_id  = fe->func_id;
+    __u64 entry_ts = fe->entry_ts;
     __u64 exit_ts  = bpf_ktime_get_ns();
-    __u64 total_ns = exit_ts - fe->entry_ts;
     __s32 stack_id = fe->user_stack_id;
 
-    /* Read all off-CPU reason breakdown fields */
-    __u64 off_cpu_ns = 0;
-    __u64 io_ns      = 0;
-    __u64 lock_ns    = 0;
-    __u64 sleep_ns   = 0;
-
-    struct off_cpu_val *oval = bpf_map_lookup_elem(&off_cpu_data, &tid);
-    if (oval) {
-        off_cpu_ns = oval->total_off_cpu_ns;
-        io_ns      = oval->total_io_ns;
-        lock_ns    = oval->total_lock_ns;
-        sleep_ns   = oval->total_sleep_ns;
-    }
-
-    __u64 on_cpu_ns = (off_cpu_ns < total_ns) ? (total_ns - off_cpu_ns) : 0;
+    /* ────────────────────────────────────────────────────────────────
+     * V2 CHANGE: Just emit raw timestamps
+     * All derivation happens in userspace
+     * ──────────────────────────────────────────────────────────────── */
 
     /* Emit event to ring buffer */
     struct profiler_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
@@ -155,16 +147,15 @@ int generic_exit(struct pt_regs *ctx)
         e->func_id         = func_id;
         e->type            = EVENT_FUNC_EXIT;
         e->timestamp_ns    = exit_ts;
-        e->duration_ns     = total_ns;
-        e->on_cpu_ns       = on_cpu_ns;
-        e->off_cpu_ns      = off_cpu_ns;
-        e->io_ns           = io_ns;
-        e->lock_ns         = lock_ns;
-        e->sleep_ns        = sleep_ns;
-        e->cpu             = bpf_get_smp_processor_id();
+        e->entry_ts        = entry_ts;      // ✓ Raw entry timestamp
+        e->exit_ts         = exit_ts;       // ✓ Raw exit timestamp
         e->user_stack_id   = stack_id;
         e->kernel_stack_id = -1;
-        e->pad             = 0;
+        e->cpu             = bpf_get_smp_processor_id();
+        e->pad2            = 0;
+        
+        /* REMOVED: on_cpu_ns, off_cpu_ns, duration_ns computation */
+        
         bpf_ringbuf_submit(e, 0);
     }
 
