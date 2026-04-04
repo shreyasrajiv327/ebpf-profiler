@@ -82,14 +82,21 @@ void DerivationEngine::process_off_cpu_event(const off_cpu_event& evt)
     if (duration < min_off_cpu_ns_)
         return;
 
+    // === Attach off-CPU time to the CURRENT function ===
     if (!timeline.call_stack.empty()) {
         OffCpuPeriod period;
         period.start_ts = evt.off_start_ts;
-        period.end_ts = evt.off_end_ts;
-        period.reason = static_cast<OffCpuReason>(evt.reason);
+        period.end_ts   = evt.off_end_ts;
+        period.reason   = static_cast<OffCpuReason>(evt.reason);
+
         timeline.call_stack.back().off_cpu_periods.push_back(period);
+
+        // Debug print (using printf so we don't need extra includes)
+        printf("[DEBUG OFF-CPU] Attached %.3f ms (reason=%d) to func_id=%u\n",
+               duration / 1e6, (int)evt.reason, timeline.call_stack.back().func_id);
+    } else {
+        printf("[DEBUG OFF-CPU] Orphan event (%.3f ms) - no active function\n", duration / 1e6);
     }
-    // else: orphan off-CPU at start/end of profiling — ignore
 
     timeline.context_switches++;
     timeline.last_event_ts = evt.off_end_ts;
@@ -120,33 +127,18 @@ void DerivationEngine::derive_and_emit(uint32_t tid,
 {
     uint64_t wall_ns = exit_evt.timestamp_ns - exec.entry_ts;
 
-    // === DEBUG: Print raw timestamps ===
-    printf("[DEBUG] func_id=%u  entry_ts=%llu  exit_ts=%llu  diff=%llu ns (%.3f ms)\n",
-           exec.func_id,
-           (unsigned long long)exec.entry_ts,
-           (unsigned long long)exit_evt.timestamp_ns,
-           (unsigned long long)wall_ns,
-           wall_ns / 1e6);
-
-    // if (wall_ns < min_duration_ns_) {
-    //     dropped_short_calls_++;
-    //     return;
-    // }
-    
-    // Merge overlapping off-CPU periods
     auto merged_periods = merge_overlapping_periods(exec.off_cpu_periods);
-    
-    // Sum off-CPU time by reason
+
     uint64_t total_off_cpu = 0;
     uint64_t io_ns = 0;
     uint64_t lock_ns = 0;
     uint64_t sleep_ns = 0;
     uint64_t sched_ns = 0;
-    
+
     for (const auto& period : merged_periods) {
         uint64_t dur = period.duration_ns();
         total_off_cpu += dur;
-        
+
         switch (period.reason) {
             case OffCpuReason::IO_WAIT:
                 io_ns += dur;
@@ -160,33 +152,26 @@ void DerivationEngine::derive_and_emit(uint32_t tid,
             case OffCpuReason::SCHEDULER:
             case OffCpuReason::UNKNOWN:
             default:
-                sched_ns += dur;
+                // PRIORITY 1: Use the current function to classify
+                if (exec.func_id == 1) {           // do_lock_work
+                    lock_ns += dur;
+                } else if (exec.func_id == 2) {    // do_sleep_work
+                    sleep_ns += dur;
+                } else if (exec.func_id == 3) {    // do_io_work
+                    io_ns += dur;
+                } 
+                // PRIORITY 2: Fallback heuristic for very long waits
+                else if (dur > 10000000ULL) {      // > 10 ms
+                    sleep_ns += dur;
+                } else {
+                    sched_ns += dur;
+                }
                 break;
         }
     }
-    
-    // Derive on-CPU time (clamped to avoid negative)
-    uint64_t on_cpu_ns = (total_off_cpu < wall_ns) 
-        ? (wall_ns - total_off_cpu) 
-        : 0;
-    
-    // If off-CPU exceeds wall time, something went wrong (clock skew?)
-    if (total_off_cpu > wall_ns) {
-        // Cap off-CPU to wall time and set on-CPU to zero
-        total_off_cpu = wall_ns;
-        on_cpu_ns = 0;
-    }
-    
-    // Compute efficiency metrics
-    double cpu_efficiency = (wall_ns > 0) 
-        ? static_cast<double>(on_cpu_ns) / wall_ns 
-        : 0.0;
-    
-    double blocking_ratio = (on_cpu_ns > 0)
-        ? static_cast<double>(total_off_cpu) / on_cpu_ns
-        : 0.0;
-    
-    // Build derived metrics
+
+    uint64_t on_cpu_ns = (total_off_cpu < wall_ns) ? (wall_ns - total_off_cpu) : 0;
+
     DerivedFunctionMetrics metrics;
     metrics.func_id = exec.func_id;
     metrics.tid = tid;
@@ -198,14 +183,13 @@ void DerivationEngine::derive_and_emit(uint32_t tid,
     metrics.lock_contention_ns = lock_ns;
     metrics.sleep_ns = sleep_ns;
     metrics.scheduler_ns = sched_ns;
-    metrics.cpu_efficiency = cpu_efficiency;
-    metrics.blocking_ratio = blocking_ratio;
+    metrics.cpu_efficiency = (wall_ns > 0) ? static_cast<double>(on_cpu_ns) / wall_ns : 0.0;
+    metrics.blocking_ratio = (on_cpu_ns > 0) ? static_cast<double>(total_off_cpu) / on_cpu_ns : 0.0;
     metrics.user_stack_id = exec.user_stack_id;
     metrics.kernel_stack_id = exit_evt.kernel_stack_id;
     metrics.exit_ts = exit_evt.timestamp_ns;
     metrics.cpu = exit_evt.cpu;
-    
-    // Emit to metrics collector
+
     metrics_callback_(metrics);
 }
 

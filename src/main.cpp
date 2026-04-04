@@ -19,6 +19,7 @@
 #include <sstream>
 #include <fstream>
 #include <algorithm>
+#include <time.h>
 
 #include <unistd.h>
 #include <fcntl.h>
@@ -66,6 +67,8 @@ static uint64_t g_total_func_exits = 0;
 static uint64_t g_total_off_cpu_events = 0;
 static uint64_t g_total_on_cpu_samples = 0;
 
+static uint64_t g_profiler_start_ns = 0;
+
 /* ═══════════════════════════════════════════════════════════════════════
  *  Signal handler
  * ═════════════════════════════════════════════════════════════════════*/
@@ -88,30 +91,32 @@ static uint32_t find_pid_by_name(const std::string &target_name)
     struct dirent *entry;
 
     while ((entry = readdir(proc_dir)) != nullptr) {
-        bool all_digits = true;
-        for (const char *p = entry->d_name; *p; ++p)
-            if (*p < '0' || *p > '9') { all_digits = false; break; }
-        if (!all_digits) continue;
+        if (entry->d_name[0] < '0' || entry->d_name[0] > '9') continue;
 
         uint32_t pid = (uint32_t)atoi(entry->d_name);
         if (pid == 0) continue;
 
-        char comm_path[64];
-        snprintf(comm_path, sizeof(comm_path), "/proc/%u/comm", pid);
+        // Read full command line (more reliable than /proc/<pid>/comm)
+        char cmdline_path[64];
+        snprintf(cmdline_path, sizeof(cmdline_path), "/proc/%u/cmdline", pid);
 
-        char comm[256] = {};
-        FILE *f = fopen(comm_path, "r");
+        FILE *f = fopen(cmdline_path, "r");
         if (!f) continue;
-        if (fgets(comm, sizeof(comm), f)) {
-            size_t len = strlen(comm);
-            if (len > 0 && comm[len-1] == '\n') comm[len-1] = '\0';
+
+        char cmdline[512] = {};
+        if (fread(cmdline, 1, sizeof(cmdline)-1, f) > 0) {
+            // Replace null bytes with spaces for easier matching
+            for (size_t i = 0; i < sizeof(cmdline); ++i) {
+                if (cmdline[i] == '\0') cmdline[i] = ' ';
+            }
+
+            if (strstr(cmdline, target_name.c_str())) {
+                found_pid = pid;
+                fclose(f);
+                break;   // take the first (usually the main server)
+            }
         }
         fclose(f);
-
-        if (target_name == comm) {
-            found_pid = pid;
-            break;
-        }
     }
 
     closedir(proc_dir);
@@ -131,6 +136,28 @@ static std::string resolve_binary_path(uint32_t pid)
     }
     resolved[n] = '\0';
     return std::string(resolved);
+}
+
+static void resolve_user_stack(int32_t stack_id, const struct bpf_object *obj, char *buf, size_t bufsz)
+{
+    if (stack_id < 0) {
+        snprintf(buf, bufsz, "[unknown]");
+        return;
+    }
+    struct bpf_map *stack_map = bpf_object__find_map_by_name((struct bpf_object*)obj, "user_stacks");
+    if (!stack_map) {
+        snprintf(buf, bufsz, "[no-stack-map]");
+        return;
+    }
+    __u64 ips[MAX_STACK_DEPTH] = {};
+    if (bpf_map_lookup_elem(bpf_map__fd(stack_map), &stack_id, ips) != 0) {
+        snprintf(buf, bufsz, "[lookup-failed]");
+        return;
+    }
+    // For now we only show the top frame (most useful for quick debug)
+    uint64_t top_ip = ips[0];
+    // You already have func_id for uprobe events; for generic stacks we can improve later
+    snprintf(buf, bufsz, "0x%llx", (unsigned long long)top_ip);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
@@ -243,7 +270,7 @@ static void on_derived_metrics(const DerivedFunctionMetrics& metrics)
            "                 io=%.3f  lock=%.3f  sleep=%.3f  sched=%.3f ms\n\n",
            (unsigned long long)call_count, fname.c_str(),
            metrics.wall_time_ns / 1e6,
-           metrics.wall_time_ns / 1000.0,           // µs
+           metrics.wall_time_ns / 1000.0,
            metrics.on_cpu_ns / 1e6,
            metrics.off_cpu_total_ns / 1e6,
            metrics.cpu_efficiency * 100.0,
@@ -252,6 +279,15 @@ static void on_derived_metrics(const DerivedFunctionMetrics& metrics)
            metrics.lock_contention_ns / 1e6,
            metrics.sleep_ns / 1e6,
            metrics.scheduler_ns / 1e6);
+
+    char stack_buf[64];
+    resolve_user_stack(metrics.user_stack_id, g_uprobe_obj, stack_buf, sizeof(stack_buf));
+    printf("... stack_top=%s\n", stack_buf);
+
+    if (g_folded_out.is_open()) {
+        g_folded_out << fname << " " << (metrics.wall_time_ns / 1000) << "\n";
+        g_folded_out.flush();
+    }
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
@@ -306,7 +342,7 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 
     /* Debug unknown events */
     uint32_t pid = *reinterpret_cast<const uint32_t*>(data);
-    uint32_t tid = *reinterpret_cast<const uint32_t*>(data + 4);
+    uint32_t tid = *reinterpret_cast<const uint32_t*>((char*)data + 4);
     fprintf(stderr, "Unknown event type: profiler_candidate=%u off_candidate=%u (pid=%u tid=%u data_sz=%zu)\n",
             type_profiler, (data_sz >= 25 ? bytes[24] : 0), pid, tid, data_sz);
     return 0;
@@ -314,7 +350,7 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 
 /* ═══════════════════════════════════════════════════════════════════════
  *  Print stats table
- * ═════════════════════════════════════════════════════════════════════*/
+ * ═══════════════════════════════════════════════════════════════════════*/
 
 static void print_table()
 {
@@ -337,6 +373,14 @@ static void print_table()
            (unsigned long long)g_derivation->get_error_count());
     printf("%s\n", std::string(90, '-').c_str());
     printf("Press Ctrl-C to stop\n");
+
+    /* Show profiler runtime */
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint64_t now_ns = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+    double runtime_sec = (now_ns - g_profiler_start_ns) / 1e9;
+
+    printf("Profiler runtime: %.1f s\n", runtime_sec);
     fflush(stdout);
 }
 
@@ -393,6 +437,12 @@ static int libbpf_print(enum libbpf_print_level level,
 
 int main(int argc, char **argv)
 {
+    /* === START OF MAIN — initialize timing === */
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    g_profiler_start_ns = ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+    /* === END OF TIMING INIT === */
+
     if (argc < 2) { usage(argv[0]); return 1; }
 
     std::string process_name = argv[1];
@@ -664,7 +714,7 @@ int main(int argc, char **argv)
     struct perf_event_attr pea = {};
     pea.type          = PERF_TYPE_SOFTWARE;
     pea.config        = PERF_COUNT_SW_CPU_CLOCK;
-    pea.sample_period = 2000000ULL;     // ~500 Hz
+    pea.sample_period = 2000000ULL;     // ~500 Hz)
     pea.wakeup_events = 1;
 
     for (int cpu = 0; cpu < nr_cpus && cpu < 128; cpu++) {
@@ -689,7 +739,7 @@ int main(int argc, char **argv)
     /* Setup ring buffers */
     struct bpf_map *urb = bpf_object__find_map_by_name(g_uprobe_obj, "events");
     struct bpf_map *orb = bpf_object__find_map_by_name(g_offcpu_obj, "events");
-    struct bpf_map *onrb = bpf_object__find_map_by_name(g_oncpu_obj, "rb");  // note: 'rb' in on_cpu.bpf.c
+    struct bpf_map *onrb = bpf_object__find_map_by_name(g_oncpu_obj, "rb"); 
 
     if (!urb || !orb || !onrb) {
         fprintf(stderr, "Could not find ring buffer maps\n");
