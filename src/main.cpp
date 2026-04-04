@@ -1,11 +1,5 @@
 /*
- * main.cpp - V2: Userspace derivation + metrics
- *
- * CHANGES:
- * - Integrated DerivationEngine
- * - Updated event handler to route events by type
- * - Removed old g_stats accumulation
- * - Handle both profiler_event and off_cpu_event
+ * main.cpp - V2: Userspace derivation + metrics + flamegraph support
  */
 
 #include <cstdio>
@@ -40,7 +34,7 @@
 
 /* ═══════════════════════════════════════════════════════════════════════
  *  Globals
- * ═════════════════════════════════════════════════════════════════════*/
+ * ═══════════════════════════════════════════════════════════════════════*/
 
 static volatile bool g_running = true;
 
@@ -55,10 +49,10 @@ static std::vector<std::string> g_func_names;
 static uint32_t  g_target_pid = 0;
 static std::string g_binary_path;
 
-/* V2: Derivation engine replaces g_stats */
+/* V2: Derivation engine */
 static DerivationEngine *g_derivation = nullptr;
 
-/* Folded-stacks output file */
+/* Folded-stacks output file for flamegraphs */
 static std::ofstream g_folded_out;
 
 /* Statistics */
@@ -71,13 +65,13 @@ static uint64_t g_profiler_start_ns = 0;
 
 /* ═══════════════════════════════════════════════════════════════════════
  *  Signal handler
- * ═════════════════════════════════════════════════════════════════════*/
+ * ═══════════════════════════════════════════════════════════════════════*/
 
 static void sig_handler(int) { g_running = false; }
 
 /* ═══════════════════════════════════════════════════════════════════════
- *  Auto PID + binary resolution
- * ═════════════════════════════════════════════════════════════════════*/
+ *  PID and binary resolution (your original code)
+ * ═══════════════════════════════════════════════════════════════════════*/
 
 static uint32_t find_pid_by_name(const std::string &target_name)
 {
@@ -96,7 +90,6 @@ static uint32_t find_pid_by_name(const std::string &target_name)
         uint32_t pid = (uint32_t)atoi(entry->d_name);
         if (pid == 0) continue;
 
-        // Read full command line (more reliable than /proc/<pid>/comm)
         char cmdline_path[64];
         snprintf(cmdline_path, sizeof(cmdline_path), "/proc/%u/cmdline", pid);
 
@@ -105,15 +98,13 @@ static uint32_t find_pid_by_name(const std::string &target_name)
 
         char cmdline[512] = {};
         if (fread(cmdline, 1, sizeof(cmdline)-1, f) > 0) {
-            // Replace null bytes with spaces for easier matching
             for (size_t i = 0; i < sizeof(cmdline); ++i) {
                 if (cmdline[i] == '\0') cmdline[i] = ' ';
             }
-
             if (strstr(cmdline, target_name.c_str())) {
                 found_pid = pid;
                 fclose(f);
-                break;   // take the first (usually the main server)
+                break;
             }
         }
         fclose(f);
@@ -130,49 +121,45 @@ static std::string resolve_binary_path(uint32_t pid)
 
     char resolved[PATH_MAX] = {};
     ssize_t n = readlink(link_path, resolved, sizeof(resolved) - 1);
-    if (n <= 0) {
-        fprintf(stderr, "readlink %s failed: %s\n", link_path, strerror(errno));
-        return {};
-    }
+    if (n <= 0) return {};
     resolved[n] = '\0';
     return std::string(resolved);
 }
 
-static void resolve_user_stack(int32_t stack_id, const struct bpf_object *obj, char *buf, size_t bufsz)
+/* ═══════════════════════════════════════════════════════════════════════
+ *  Stack resolution → folded stack for flamegraphs (IMPROVED)
+ * ═══════════════════════════════════════════════════════════════════════*/
+
+static std::string resolve_user_stack(int32_t stack_id, const struct bpf_object *obj)
 {
-    if (stack_id < 0) {
-        snprintf(buf, bufsz, "[unknown]");
-        return;
-    }
+    if (stack_id < 0) return "unknown";
+
     struct bpf_map *stack_map = bpf_object__find_map_by_name((struct bpf_object*)obj, "user_stacks");
-    if (!stack_map) {
-        snprintf(buf, bufsz, "[no-stack-map]");
-        return;
-    }
+    if (!stack_map) return "no-stack-map";
+
     __u64 ips[MAX_STACK_DEPTH] = {};
     if (bpf_map_lookup_elem(bpf_map__fd(stack_map), &stack_id, ips) != 0) {
-        snprintf(buf, bufsz, "[lookup-failed]");
-        return;
+        return "lookup-failed";
     }
-    // For now we only show the top frame (most useful for quick debug)
-    uint64_t top_ip = ips[0];
-    // You already have func_id for uprobe events; for generic stacks we can improve later
-    snprintf(buf, bufsz, "0x%llx", (unsigned long long)top_ip);
+
+    std::string stack;
+    for (int i = 0; i < MAX_STACK_DEPTH && ips[i] != 0; ++i) {
+        if (!stack.empty()) stack += ";";
+        stack += "0x" + std::to_string(ips[i]);
+    }
+    return stack.empty() ? "empty-stack" : stack;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
- *  Get runtime load base from /proc/<pid>/maps
- * ═════════════════════════════════════════════════════════════════════*/
+ *  Get runtime load base
+ * ═══════════════════════════════════════════════════════════════════════*/
 
 static uint64_t get_load_base(uint32_t pid, const std::string &binary_path)
 {
     char maps_path[64];
     snprintf(maps_path, sizeof(maps_path), "/proc/%u/maps", pid);
     FILE *f = fopen(maps_path, "r");
-    if (!f) {
-        fprintf(stderr, "Cannot open %s: %s\n", maps_path, strerror(errno));
-        return 0;
-    }
+    if (!f) return 0;
 
     uint64_t base = 0;
     char line[512];
@@ -187,8 +174,8 @@ static uint64_t get_load_base(uint32_t pid, const std::string &binary_path)
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
- *  Helpers
- * ═════════════════════════════════════════════════════════════════════*/
+ *  Helpers (your original code)
+ * ═══════════════════════════════════════════════════════════════════════*/
 
 static void bump_memlock_rlimit()
 {
@@ -205,19 +192,12 @@ static int set_target_pid(struct bpf_object *obj, uint32_t pid)
     return bpf_map_update_elem(fd, &key, &pid, BPF_ANY);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════
- *  ELF symbol lookup
- * ═════════════════════════════════════════════════════════════════════*/
-
 static uint64_t find_symbol_offset(const char *binary, const char *sym_name)
 {
     if (elf_version(EV_CURRENT) == EV_NONE) return 0;
 
     int fd = open(binary, O_RDONLY);
-    if (fd < 0) {
-        fprintf(stderr, "Cannot open binary %s: %s\n", binary, strerror(errno));
-        return 0;
-    }
+    if (fd < 0) return 0;
 
     Elf *elf = elf_begin(fd, ELF_C_READ, nullptr);
     if (!elf) { close(fd); return 0; }
@@ -254,8 +234,8 @@ static uint64_t find_symbol_offset(const char *binary, const char *sym_name)
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
- *  Derivation callback - receives derived metrics
- * ═════════════════════════════════════════════════════════════════════*/
+ *  Derivation callback - generates folded stacks for flamegraphs
+ * ═══════════════════════════════════════════════════════════════════════*/
 
 static void on_derived_metrics(const DerivedFunctionMetrics& metrics)
 {
@@ -266,11 +246,10 @@ static void on_derived_metrics(const DerivedFunctionMetrics& metrics)
         (metrics.func_id < g_func_names.size())
             ? g_func_names[metrics.func_id] : "unknown_func";
 
-    printf("[DERIVED #%llu] %s  wall=%.3f ms (%.0f µs)  on=%.3f ms  off=%.3f ms  eff=%.1f%%  block=%.2fx\n"
-           "                 io=%.3f  lock=%.3f  sleep=%.3f  sched=%.3f ms\n\n",
+    printf("[DERIVED #%llu] %s  wall=%.3f ms  on=%.3f ms  off=%.3f ms  eff=%.1f%%  block=%.2fx\n"
+           "                 io=%.3f  lock=%.3f  sleep=%.3f  sched=%.3f ms\n",
            (unsigned long long)call_count, fname.c_str(),
            metrics.wall_time_ns / 1e6,
-           metrics.wall_time_ns / 1000.0,
            metrics.on_cpu_ns / 1e6,
            metrics.off_cpu_total_ns / 1e6,
            metrics.cpu_efficiency * 100.0,
@@ -280,13 +259,13 @@ static void on_derived_metrics(const DerivedFunctionMetrics& metrics)
            metrics.sleep_ns / 1e6,
            metrics.scheduler_ns / 1e6);
 
-    char stack_buf[64];
-    resolve_user_stack(metrics.user_stack_id, g_uprobe_obj, stack_buf, sizeof(stack_buf));
-    printf("... stack_top=%s\n", stack_buf);
-
+    // Generate folded stack for flamegraphs
     if (g_folded_out.is_open()) {
-        g_folded_out << fname << " " << (metrics.wall_time_ns / 1000) << "\n";
-        g_folded_out.flush();
+        std::string stack = resolve_user_stack(metrics.user_stack_id, g_uprobe_obj);
+        if (!stack.empty()) {
+            g_folded_out << stack << ";" << fname << " " << (metrics.wall_time_ns / 1000) << "\n";
+            g_folded_out.flush();
+        }
     }
 }
 
