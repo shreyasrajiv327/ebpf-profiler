@@ -1,0 +1,11 @@
+# ninja log v5
+0	521	1775395555920729069	on_cpu.bpf.o	34b3c6fabddfe92b
+0	521	1775395555920729069	/home/shreyas27/ebpf-project/final/test/on_cpu.bpf.o	34b3c6fabddfe92b
+0	523	1775395555922729170	uprobe.bpf.o	5779200001104851
+0	523	1775395555922729170	/home/shreyas27/ebpf-project/final/test/uprobe.bpf.o	5779200001104851
+0	203	1775395689621079641	off_cpu.bpf.o	c0d7ef09847bcf47
+0	203	1775395689621079641	/home/shreyas27/ebpf-project/final/test/off_cpu.bpf.o	c0d7ef09847bcf47
+203	518	1775395689938094474	CMakeFiles/profiler.dir/src/types.cpp.o	e36c02f6db1eb342
+203	548	1775395689968095878	CMakeFiles/profiler.dir/src/derivation.cpp.o	4ae0e9fd890dbf9a
+203	4724	1775395694139291033	CMakeFiles/profiler.dir/src/main.cpp.o	b93c08faa3672b5e
+4724	4898	1775395694309298986	profiler	4a82601b0d16d0e9

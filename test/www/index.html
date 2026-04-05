@@ -1,0 +1,887 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>eBPF Live Profiler — Photon</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg:        #080c10;
+    --surface:   #0d1117;
+    --panel:     #111820;
+    --border:    #1e2d3d;
+    --border2:   #263445;
+    --text:      #cdd9e5;
+    --muted:     #5c7a96;
+    --accent:    #00d4ff;
+    --accent2:   #0099cc;
+    --on-cpu:    #2563eb;
+    --off-cpu:   #dc4a26;
+    --io:        #d97706;
+    --lock:      #dc2626;
+    --sleep:     #7c3aed;
+    --sched:     #475569;
+    --wall:      #059669;
+    --green:     #22c55e;
+    --yellow:    #eab308;
+    --red:       #ef4444;
+    --radius:    6px;
+    --font-mono: 'JetBrains Mono', monospace;
+    --font-ui:   'Syne', sans-serif;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font-mono);
+    font-size: 13px;
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
+
+  body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background-image:
+      linear-gradient(rgba(0,212,255,0.015) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(0,212,255,0.015) 1px, transparent 1px);
+    background-size: 40px 40px;
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  /* ─── HEADER ─── */
+  #header {
+    position: sticky;
+    top: 0;
+    z-index: 100;
+    background: rgba(8,12,16,0.97);
+    backdrop-filter: blur(12px);
+    border-bottom: 1px solid var(--border);
+    padding: 0 18px;
+    height: 54px;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+  }
+
+  #header-title {
+    font-family: var(--font-ui);
+    font-weight: 800;
+    font-size: 14px;
+    color: #fff;
+    white-space: nowrap;
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    flex-shrink: 0;
+  }
+  #header-title .dim { color: var(--muted); font-weight: 400; }
+
+  .status-badge {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    background: rgba(34,197,94,0.1);
+    border: 1px solid rgba(34,197,94,0.25);
+    border-radius: 20px;
+    padding: 3px 10px;
+    font-size: 11px;
+    color: var(--green);
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+  .status-badge .dot { width:6px;height:6px;border-radius:50%;background:var(--green);animation:pulse 1.4s ease-in-out infinite; }
+  @keyframes pulse { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:.5;transform:scale(.8)} }
+  .status-badge.paused { color:var(--yellow);background:rgba(234,179,8,.1);border-color:rgba(234,179,8,.25); }
+  .status-badge.paused .dot { background:var(--yellow);animation:none; }
+
+  #header-meta {
+    display: flex;
+    gap: 14px;
+    align-items: center;
+    color: var(--muted);
+    font-size: 11px;
+    flex: 1;
+    overflow: hidden;
+  }
+  #header-meta span { white-space:nowrap; }
+  #header-meta strong { color: var(--text); }
+
+  #header-actions { display:flex;gap:7px;flex-shrink:0; }
+
+  .btn {
+    background: var(--panel);
+    border: 1px solid var(--border2);
+    color: var(--text);
+    padding: 5px 11px;
+    border-radius: var(--radius);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    cursor: pointer;
+    transition: all .15s;
+    white-space: nowrap;
+  }
+  .btn:hover { background:var(--border);border-color:var(--muted);color:#fff; }
+  .btn.primary { background:var(--accent2);border-color:var(--accent);color:#000;font-weight:700; }
+  .btn.primary:hover { background:var(--accent); }
+  .btn.danger { border-color:rgba(239,68,68,.4);color:var(--red); }
+  .btn.danger:hover { background:rgba(239,68,68,.1); }
+
+  /* ─── LAYOUT ─── */
+  #app {
+    position: relative;
+    z-index: 1;
+    display: grid;
+    grid-template-columns: 1fr 272px;
+    gap: 11px;
+    padding: 11px 14px 28px;
+    max-width: 1580px;
+    margin: 0 auto;
+  }
+
+  .panel {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+    animation: fadeIn .35s ease both;
+  }
+  @keyframes fadeIn { from{opacity:0;transform:translateY(8px)} to{opacity:1;transform:translateY(0)} }
+
+  .panel-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 9px 13px;
+    border-bottom: 1px solid var(--border);
+    background: rgba(13,17,23,.5);
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+  .panel-title {
+    font-family: var(--font-ui);
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    color: var(--muted);
+    flex-shrink: 0;
+  }
+
+  /* ─── FLAMEGRAPH ─── */
+  #flamegraph-panel { grid-column:1;grid-row:1; }
+
+  .fg-controls { display:flex;gap:6px;align-items:center;flex-wrap:wrap; }
+
+  .toggle-btn {
+    background: transparent;
+    border: 1px solid var(--border2);
+    color: var(--muted);
+    padding: 4px 11px;
+    border-radius: 4px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    cursor: pointer;
+    transition: all .15s;
+  }
+  .toggle-btn.active[data-mode="wall"]   { background:rgba(5,150,105,.2);border-color:var(--wall);color:#6ee7b7; }
+  .toggle-btn.active[data-mode="oncpu"]  { background:rgba(37,99,235,.2);border-color:var(--on-cpu);color:#93c5fd; }
+  .toggle-btn.active[data-mode="offcpu"] { background:rgba(220,74,38,.2);border-color:var(--off-cpu);color:#fca5a5; }
+  .toggle-btn:not(.active):hover { border-color:var(--muted);color:var(--text); }
+
+  #fg-search {
+    background:var(--panel);border:1px solid var(--border2);color:var(--text);
+    padding:4px 9px;border-radius:4px;font-family:var(--font-mono);font-size:11px;
+    width:130px;outline:none;margin-left:auto;
+  }
+  #fg-search:focus { border-color:var(--accent2); }
+  #fg-search::placeholder { color:var(--muted); }
+
+  #flamegraph-canvas-wrap { padding:10px;position:relative;min-height:270px; }
+  #flamegraph-svg { width:100%;display:block;cursor:crosshair; }
+
+  /* ─── TOOLTIP ─── */
+  #tooltip {
+    position:fixed;background:#0a1520;border:1px solid var(--accent2);
+    border-radius:8px;padding:10px 13px;pointer-events:none;z-index:1000;
+    min-width:210px;display:none;box-shadow:0 8px 32px rgba(0,0,0,.7);
+    font-size:11px;line-height:1.85;
+  }
+  .tt-title { font-family:var(--font-ui);font-size:13px;font-weight:700;color:#fff;margin-bottom:6px;border-bottom:1px solid var(--border2);padding-bottom:6px; }
+  .tt-row { display:flex;justify-content:space-between;gap:14px; }
+  .tt-label { color:var(--muted); }
+  .tt-val { color:var(--text);font-weight:500; }
+  .tt-val.wall { color:#6ee7b7; }
+  .tt-val.oncpu { color:#93c5fd; }
+  .tt-val.offcpu { color:#fca5a5; }
+  .tt-breakdown { margin-top:6px;padding-top:6px;border-top:1px solid var(--border);display:flex;gap:6px;flex-wrap:wrap; }
+  .tt-chip { border-radius:3px;padding:1px 6px;font-size:10px; }
+
+  /* ─── SIDEBAR ─── */
+  #sidebar { grid-column:2;grid-row:1/3;display:flex;flex-direction:column;gap:11px; }
+
+  #breakdown-body { padding:13px; }
+  .breakdown-total { font-family:var(--font-ui);font-size:20px;font-weight:800;color:#fff;margin-bottom:3px; }
+  .breakdown-sub { color:var(--muted);font-size:10px;margin-bottom:12px; }
+  .breakdown-bar { height:9px;border-radius:5px;display:flex;overflow:hidden;margin-bottom:11px;gap:1px; }
+  .breakdown-bar-seg { height:100%;transition:width .5s ease; }
+  .breakdown-items { display:flex;flex-direction:column;gap:7px; }
+  .breakdown-item { display:flex;align-items:center;gap:7px;font-size:11px; }
+  .bi-dot { width:7px;height:7px;border-radius:2px;flex-shrink:0; }
+  .bi-name { flex:1;color:var(--muted);font-size:10px; }
+  .bi-bar { flex:2;height:4px;background:var(--panel);border-radius:2px;overflow:hidden; }
+  .bi-fill { height:100%;border-radius:2px;transition:width .5s ease; }
+  .bi-pct { color:var(--text);font-weight:500;width:30px;text-align:right;font-size:10px; }
+  .bi-ms { color:var(--muted);width:56px;text-align:right;font-size:10px; }
+
+  .summary-cards { display:flex;flex-direction:column;gap:7px;padding:9px 13px;border-top:1px solid var(--border); }
+  .s-card { background:var(--panel);border:1px solid var(--border);border-radius:6px;padding:7px 9px; }
+  .s-card-label { color:var(--muted);font-size:9px;text-transform:uppercase;letter-spacing:.07em;margin-bottom:3px; }
+  .s-card-val { font-family:var(--font-ui);font-size:15px;font-weight:700;color:#fff; }
+  .s-card-sub { color:var(--muted);font-size:9px;margin-top:2px; }
+
+  /* stats */
+  .stats-grid { display:grid;grid-template-columns:1fr 1fr;gap:1px;background:var(--border); }
+  .stat-cell { background:var(--surface);padding:9px 11px; }
+  .stat-label { color:var(--muted);font-size:9px;text-transform:uppercase;letter-spacing:.07em;margin-bottom:2px; }
+  .stat-val { font-family:var(--font-ui);font-size:17px;font-weight:700;color:var(--accent); }
+  .stat-val.warn { color:var(--yellow); }
+  .stat-val.err  { color:var(--red); }
+
+  /* ─── TABLE ─── */
+  #table-panel { grid-column:1/3;grid-row:2;animation-delay:.1s; }
+
+  .table-controls { display:flex;gap:7px;align-items:center;flex-wrap:wrap; }
+
+  #tbl-search {
+    background:var(--panel);border:1px solid var(--border2);color:var(--text);
+    padding:4px 9px;border-radius:4px;font-family:var(--font-mono);font-size:11px;
+    width:150px;outline:none;
+  }
+  #tbl-search:focus { border-color:var(--accent2); }
+  #tbl-search::placeholder { color:var(--muted); }
+
+  .seg-group { display:flex;gap:3px; }
+  .seg-btn {
+    background:var(--panel);border:1px solid var(--border2);color:var(--muted);
+    padding:4px 9px;border-radius:4px;font-family:var(--font-mono);font-size:10px;cursor:pointer;transition:all .15s;
+  }
+  .seg-btn.active { background:rgba(0,212,255,.1);border-color:var(--accent2);color:var(--accent); }
+  .seg-btn:hover:not(.active) { border-color:var(--muted);color:var(--text); }
+
+  .table-wrap { overflow-x:auto;max-height:340px;overflow-y:auto; }
+
+  table { width:100%;border-collapse:collapse;font-size:12px; }
+
+  thead th {
+    position:sticky;top:0;background:var(--panel);color:var(--muted);
+    font-size:9px;font-weight:500;text-transform:uppercase;letter-spacing:.07em;
+    padding:8px 9px;text-align:right;border-bottom:1px solid var(--border);
+    cursor:pointer;white-space:nowrap;user-select:none;
+  }
+  thead th:first-child { text-align:left; }
+  thead th:hover { color:var(--text); }
+  thead th.sorted { color:var(--accent); }
+
+  tbody tr { border-bottom:1px solid rgba(30,45,61,.5);transition:background .1s;cursor:pointer; }
+  tbody tr:hover { background:rgba(0,212,255,.04); }
+  tbody tr.highlighted { background:rgba(0,212,255,.08);outline:1px solid rgba(0,212,255,.15); }
+  tbody tr.top5 .fn-name::before { content:'★ ';color:var(--yellow);font-size:9px; }
+
+  tbody td { padding:7px 9px;text-align:right;color:var(--text);white-space:nowrap; }
+  tbody td:first-child { text-align:left; }
+
+  .fn-name { font-family:var(--font-mono);color:#fff;font-size:12px; }
+
+  .eff-bar { display:flex;align-items:center;gap:5px;justify-content:flex-end; }
+  .eff-track { width:44px;height:4px;background:var(--panel);border-radius:2px;overflow:hidden; }
+  .eff-fill { height:100%;border-radius:2px;transition:width .4s; }
+
+  .metric-io    { color:#fbbf24; }
+  .metric-lock  { color:#f87171; }
+  .metric-sleep { color:#c4b5fd; }
+  .metric-sched { color:#94a3b8; }
+  .metric-wall  { color:#6ee7b7; }
+  .metric-on    { color:#93c5fd; }
+  .metric-off   { color:#fca5a5; }
+
+  ::-webkit-scrollbar { width:5px;height:5px; }
+  ::-webkit-scrollbar-track { background:var(--surface); }
+  ::-webkit-scrollbar-thumb { background:var(--border2);border-radius:3px; }
+  ::-webkit-scrollbar-thumb:hover { background:var(--muted); }
+
+  .empty-state { display:flex;flex-direction:column;align-items:center;justify-content:center;height:220px;gap:10px;color:var(--muted); }
+  .empty-state svg { opacity:.3; }
+  .empty-state p { font-size:12px; }
+</style>
+</head>
+<body>
+
+<header id="header">
+  <div id="header-title">
+    <svg width="17" height="17" viewBox="0 0 24 24" fill="none">
+      <path d="M12 2L2 7v10l10 5 10-5V7L12 2z" stroke="var(--accent)" stroke-width="1.5"/>
+      <path d="M12 7v10M7 9.5l5 2.5 5-2.5" stroke="var(--accent)" stroke-width="1.5" stroke-linecap="round"/>
+    </svg>
+    eBPF Live Profiler
+    <span class="dim">— <span id="hdr-binary">unknown</span> (PID: <span id="hdr-pid">—</span>)</span>
+  </div>
+
+  <div id="hdr-status" class="status-badge">
+    <div class="dot"></div>
+    <span id="status-text">Connecting…</span>
+  </div>
+
+  <div id="header-meta">
+    <span>Runtime: <strong id="hdr-runtime">0.0s</strong></span>
+    <span>Total Calls: <strong id="hdr-calls">0</strong></span>
+    <span>Entries/Exits: <strong id="hdr-entries">0</strong> / <strong id="hdr-exits">0</strong></span>
+    <span>On-CPU Samples: <strong id="hdr-samples">0</strong></span>
+  </div>
+
+  <div id="header-actions">
+    <button class="btn" id="btn-pause">⏸ Pause</button>
+    <button class="btn danger" id="btn-clear">✕ Clear</button>
+    <button class="btn" id="btn-export-csv">↓ CSV</button>
+    <button class="btn primary" id="btn-export-svg">↓ SVG</button>
+  </div>
+</header>
+
+<div id="app">
+
+  <!-- FLAMEGRAPH -->
+  <div class="panel" id="flamegraph-panel">
+    <div class="panel-header">
+      <span class="panel-title">Flamegraph</span>
+      <div class="fg-controls">
+        <button class="toggle-btn active" data-mode="wall"   onclick="setFgMode('wall')">Wall Time</button>
+        <button class="toggle-btn"        data-mode="oncpu"  onclick="setFgMode('oncpu')">On-CPU</button>
+        <button class="toggle-btn"        data-mode="offcpu" onclick="setFgMode('offcpu')">Off-CPU</button>
+        <input id="fg-search" type="text" placeholder="Search functions…" oninput="filterFg(this.value)">
+      </div>
+    </div>
+    <div id="flamegraph-canvas-wrap">
+      <svg id="flamegraph-svg" height="268"></svg>
+    </div>
+  </div>
+
+  <!-- SIDEBAR -->
+  <div id="sidebar">
+
+    <div class="panel" id="breakdown-panel" style="animation-delay:.05s">
+      <div class="panel-header"><span class="panel-title">Off-CPU Breakdown</span></div>
+      <div id="breakdown-body">
+        <div class="breakdown-total" id="bk-total">0.000 ms</div>
+        <div class="breakdown-sub">Total off-CPU waiting time across all calls</div>
+        <div class="breakdown-bar" id="bk-bar">
+          <div class="breakdown-bar-seg" style="background:var(--io);width:0%"></div>
+          <div class="breakdown-bar-seg" style="background:var(--lock);width:0%"></div>
+          <div class="breakdown-bar-seg" style="background:var(--sleep);width:0%"></div>
+          <div class="breakdown-bar-seg" style="background:var(--sched);width:0%"></div>
+        </div>
+        <div class="breakdown-items">
+          <div class="breakdown-item">
+            <div class="bi-dot" style="background:var(--io)"></div>
+            <span class="bi-name">IO Wait</span>
+            <div class="bi-bar"><div class="bi-fill" id="bk-io-bar" style="background:var(--io);width:0%"></div></div>
+            <span class="bi-pct" id="bk-io-pct">0%</span>
+            <span class="bi-ms" id="bk-io-ms">0.000 ms</span>
+          </div>
+          <div class="breakdown-item">
+            <div class="bi-dot" style="background:var(--lock)"></div>
+            <span class="bi-name">Lock Contention</span>
+            <div class="bi-bar"><div class="bi-fill" id="bk-lock-bar" style="background:var(--lock);width:0%"></div></div>
+            <span class="bi-pct" id="bk-lock-pct">0%</span>
+            <span class="bi-ms" id="bk-lock-ms">0.000 ms</span>
+          </div>
+          <div class="breakdown-item">
+            <div class="bi-dot" style="background:var(--sleep)"></div>
+            <span class="bi-name">Sleep</span>
+            <div class="bi-bar"><div class="bi-fill" id="bk-sleep-bar" style="background:var(--sleep);width:0%"></div></div>
+            <span class="bi-pct" id="bk-sleep-pct">0%</span>
+            <span class="bi-ms" id="bk-sleep-ms">0.000 ms</span>
+          </div>
+          <div class="breakdown-item">
+            <div class="bi-dot" style="background:var(--sched)"></div>
+            <span class="bi-name">Scheduler</span>
+            <div class="bi-bar"><div class="bi-fill" id="bk-sched-bar" style="background:var(--sched);width:0%"></div></div>
+            <span class="bi-pct" id="bk-sched-pct">0%</span>
+            <span class="bi-ms" id="bk-sched-ms">0.000 ms</span>
+          </div>
+        </div>
+      </div>
+      <div class="summary-cards">
+        <div class="s-card">
+          <div class="s-card-label">Biggest Bottleneck</div>
+          <div class="s-card-val" id="bk-biggest" style="font-size:13px;color:var(--red)">—</div>
+        </div>
+        <div class="s-card">
+          <div class="s-card-label">Avg CPU Efficiency</div>
+          <div class="s-card-val" id="bk-eff">—</div>
+          <div class="s-card-sub">on-cpu ÷ wall time</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel" id="stats-panel" style="animation-delay:.08s">
+      <div class="panel-header"><span class="panel-title">Event Statistics</span></div>
+      <div class="stats-grid">
+        <div class="stat-cell"><div class="stat-label">Entries</div><div class="stat-val" id="st-entries">0</div></div>
+        <div class="stat-cell"><div class="stat-label">Exits</div><div class="stat-val" id="st-exits">0</div></div>
+        <div class="stat-cell"><div class="stat-label">Off-CPU Evts</div><div class="stat-val" id="st-offcpu">0</div></div>
+        <div class="stat-cell"><div class="stat-label">On-CPU Samples</div><div class="stat-val" id="st-oncpu">0</div></div>
+        <div class="stat-cell"><div class="stat-label">Processed</div><div class="stat-val" id="st-processed">0</div></div>
+        <div class="stat-cell"><div class="stat-label">Dropped</div><div class="stat-val warn" id="st-dropped">0</div></div>
+        <div class="stat-cell" style="grid-column:1/-1"><div class="stat-label">Errors</div><div class="stat-val err" id="st-errors">0</div></div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- TABLE -->
+  <div class="panel" id="table-panel">
+    <div class="panel-header">
+      <span class="panel-title">Per-Function Details</span>
+      <div class="table-controls">
+        <input id="tbl-search" type="text" placeholder="Filter functions…" oninput="filterTable(this.value)">
+        <div class="seg-group" id="time-mode-toggle">
+          <button class="seg-btn active" onclick="setTimeMode('abs',this)">ms</button>
+          <button class="seg-btn" onclick="setTimeMode('pct',this)">%</button>
+        </div>
+        <div class="seg-group" id="time-range">
+          <button class="seg-btn active" onclick="setRange('all',this)">All</button>
+          <button class="seg-btn" onclick="setRange('30s',this)">30s</button>
+          <button class="seg-btn" onclick="setRange('10s',this)">10s</button>
+        </div>
+      </div>
+    </div>
+    <div class="table-wrap">
+      <table id="fn-table">
+        <thead>
+          <tr>
+            <th onclick="sortTable('name')" data-col="name">Function <span class="sa">↕</span></th>
+            <th onclick="sortTable('calls')" data-col="calls">Calls <span class="sa">↕</span></th>
+            <th onclick="sortTable('wall')" data-col="wall" class="sorted">Wall <span class="sa">↓</span></th>
+            <th onclick="sortTable('oncpu')" data-col="oncpu">On-CPU <span class="sa">↕</span></th>
+            <th onclick="sortTable('offcpu')" data-col="offcpu">Off-CPU <span class="sa">↕</span></th>
+            <th onclick="sortTable('eff')" data-col="eff">Efficiency <span class="sa">↕</span></th>
+            <th onclick="sortTable('io')" data-col="io">IO <span class="sa">↕</span></th>
+            <th onclick="sortTable('lock')" data-col="lock">Lock <span class="sa">↕</span></th>
+            <th onclick="sortTable('sleep')" data-col="sleep">Sleep <span class="sa">↕</span></th>
+            <th onclick="sortTable('sched')" data-col="sched">Sched <span class="sa">↕</span></th>
+          </tr>
+        </thead>
+        <tbody id="fn-tbody"></tbody>
+      </table>
+    </div>
+  </div>
+
+</div>
+
+<!-- TOOLTIP -->
+<div id="tooltip">
+  <div class="tt-title" id="tt-name">—</div>
+  <div class="tt-row"><span class="tt-label">Wall</span><span class="tt-val wall" id="tt-wall">—</span></div>
+  <div class="tt-row"><span class="tt-label">On-CPU</span><span class="tt-val oncpu" id="tt-on">—</span></div>
+  <div class="tt-row"><span class="tt-label">Off-CPU</span><span class="tt-val offcpu" id="tt-off">—</span></div>
+  <div class="tt-breakdown">
+    <span class="tt-chip" style="background:rgba(217,119,6,.2);color:#fbbf24" id="tt-io">IO —</span>
+    <span class="tt-chip" style="background:rgba(220,38,38,.2);color:#f87171" id="tt-lock">Lock —</span>
+    <span class="tt-chip" style="background:rgba(124,58,237,.2);color:#c4b5fd" id="tt-sleep">Sleep —</span>
+    <span class="tt-chip" style="background:rgba(71,85,105,.3);color:#94a3b8" id="tt-sched">Sched —</span>
+  </div>
+</div>
+
+<script>
+// ═══════════════════════════════════════════
+//  STATE
+// ═══════════════════════════════════════════
+const state = {
+  paused: false,
+  fgMode: 'wall',
+  timeMode: 'abs',
+  timeRange: 'all',
+  sortCol: 'wall',
+  sortDir: -1,
+  filterFg: '',
+  filterTbl: '',
+  highlightedFn: null,
+  startTime: Date.now(),
+  functions: {},
+  stats: { entries:0, exits:0, offcpu:0, oncpu:0, processed:0, dropped:0, errors:0 },
+  pid: 0,
+  binary: 'unknown'
+};
+
+// ═══════════════════════════════════════════
+//  FETCH LIVE DATA + TRANSFORM TO MATCH UI
+// ═══════════════════════════════════════════
+function fetchData() {
+  fetch('/data')
+    .then(r => r.json())
+    .then(data => {
+      // PID + binary (will be added in C++ soon)
+      if (data.pid) state.pid = data.pid;
+      if (data.binary) state.binary = data.binary;
+
+      if (data.start_ns) {
+        const runtimeSec = data.runtime_sec || ((Date.now() / 1000) - (data.start_ns / 1e9));
+        document.getElementById('hdr-runtime').textContent = runtimeSec.toFixed(1) + 's';
+      }
+
+      // Update stats from backend
+      if (data.entries !== undefined) state.stats.entries = data.entries;
+      if (data.exits !== undefined)   state.stats.exits = data.exits;
+      if (data.oncpu_samples !== undefined) state.stats.oncpu = data.oncpu_samples;
+      if (data.processed !== undefined) state.stats.processed = data.processed;
+      if (data.dropped !== undefined)   state.stats.dropped = data.dropped;
+      if (data.errors !== undefined)    state.stats.errors = data.errors;
+
+      // Transform functions object into the format the UI expects
+      if (data.functions && typeof data.functions === 'object') {
+        state.functions = {};
+        Object.keys(data.functions).forEach(name => {
+          const f = data.functions[name];
+          const wall = f.wall || 0;
+          const oncpu = f.oncpu || 0;
+          const calls = f.calls || 0;
+
+          state.functions[name] = {
+            name: name,
+            calls: calls,
+            wall: wall,
+            oncpu: oncpu,
+            offcpu: f.offcpu || 0,
+            io: f.io || 0,
+            lock: f.lock || 0,
+            sleep: f.sleep || 0,
+            sched: f.sched || 0,
+            eff_sum: calls * (wall > 0 ? oncpu / wall : 0)   // calculate efficiency
+          };
+        });
+      }
+
+      renderAll();
+      updateHeader();
+    })
+    .catch(() => {});
+}
+
+// ═══════════════════════════════════════════
+//  HEADER
+// ═══════════════════════════════════════════
+function updateHeader(){
+  const tot = Object.values(state.functions).reduce((a, f) => a + (f.calls || 0), 0);
+  document.getElementById('hdr-calls').textContent = tot.toLocaleString();
+  document.getElementById('hdr-entries').textContent = state.stats.entries.toLocaleString();
+  document.getElementById('hdr-exits').textContent = state.stats.exits.toLocaleString();
+  document.getElementById('hdr-samples').textContent = state.stats.oncpu.toLocaleString();
+}
+
+// ═══════════════════════════════════════════
+//  BREAKDOWN
+// ═══════════════════════════════════════════
+function updateBreakdown(){
+  const fns = Object.values(state.functions);
+  let io = 0, lock = 0, sleep = 0, sched = 0, eff_sum = 0, cnt = 0;
+  fns.forEach(f => {
+    io += f.io || 0; lock += f.lock || 0; sleep += f.sleep || 0; sched += f.sched || 0;
+    eff_sum += f.eff_sum || 0;
+    cnt += f.calls || 0;
+  });
+  const totalOff = io + lock + sleep + sched;
+  document.getElementById('bk-total').textContent = totalOff.toFixed(3) + ' ms';
+  const segs = document.querySelectorAll('#bk-bar .breakdown-bar-seg');
+  [io, lock, sleep, sched].forEach((v, i) => segs[i].style.width = (totalOff > 0 ? v / totalOff * 100 : 0) + '%');
+  const parts = [{k:'io',v:io},{k:'lock',v:lock},{k:'sleep',v:sleep},{k:'sched',v:sched}];
+  const maxV = Math.max(...parts.map(p => p.v), 1);
+  parts.forEach(p => {
+    const pct = totalOff > 0 ? p.v / totalOff * 100 : 0;
+    document.getElementById('bk-' + p.k + '-pct').textContent = pct.toFixed(0) + '%';
+    document.getElementById('bk-' + p.k + '-ms').textContent = p.v.toFixed(2) + ' ms';
+    document.getElementById('bk-' + p.k + '-bar').style.width = (p.v / maxV * 100) + '%';
+  });
+  const big = parts.reduce((a, b) => a.v > b.v ? a : b);
+  const bigPct = totalOff > 0 ? (big.v / totalOff * 100).toFixed(0) : 0;
+  const labels = {io:'IO Wait', lock:'Lock Contention', sleep:'Sleep', sched:'Scheduler'};
+  document.getElementById('bk-biggest').textContent = big.v > 0 ? `${labels[big.k]} (${bigPct}%)` : '—';
+  document.getElementById('bk-eff').textContent = cnt > 0 ? (eff_sum / cnt * 100).toFixed(1) + '%' : '—';
+}
+
+// ═══════════════════════════════════════════
+//  STATS
+// ═══════════════════════════════════════════
+function updateStats(){
+  const s = state.stats;
+  ['entries','exits','offcpu','oncpu','processed','dropped','errors'].forEach(k => {
+    const el = document.getElementById('st-' + k);
+    if (el) el.textContent = (s[k] || 0).toLocaleString();
+  });
+}
+
+// ═══════════════════════════════════════════
+//  FLAMEGRAPH
+// ═══════════════════════════════════════════
+const colorCache = {};
+function getColor(name, mode, f) {
+  const key = name + mode;
+  if (!colorCache[key]) {
+    if (mode === 'wall') {
+      const e = (f.eff_sum || 0) / Math.max(f.calls, 1);
+      colorCache[key] = e > .65 ? '#047857' : e > .35 ? '#0e7490' : '#0f766e';
+    } else if (mode === 'oncpu') {
+      const blues = ['#1d4ed8','#2563eb','#1e40af','#1e3a8a'];
+      colorCache[key] = blues[name.length % blues.length];
+    } else {
+      const r = f.offcpu || 1;
+      if (f.lock / r > .4) colorCache[key] = '#dc2626';
+      else if (f.io / r > .4) colorCache[key] = '#d97706';
+      else if (f.sleep / r > .4) colorCache[key] = '#7c3aed';
+      else colorCache[key] = '#475569';
+    }
+  }
+  return colorCache[key];
+}
+
+function renderFlamegraph(){
+  const svg = document.getElementById('flamegraph-svg');
+  const wrap = document.getElementById('flamegraph-canvas-wrap');
+  const W = wrap.clientWidth - 20;
+  const mode = state.fgMode;
+  const search = state.filterFg.toLowerCase();
+
+  const fns = Object.values(state.functions).filter(f => f.calls > 0);
+  if (!fns.length) {
+    svg.innerHTML = `<text x="${W/2}" y="134" text-anchor="middle" fill="#2a3f52" font-family="JetBrains Mono" font-size="13">Waiting for profiler events…</text>`;
+    svg.setAttribute('height', 268);
+    return;
+  }
+
+  const getM = f => mode === 'wall' ? f.wall : mode === 'oncpu' ? f.oncpu : f.offcpu;
+  const total = fns.reduce((s, f) => s + getM(f), 0) || 1;
+  fns.sort((a, b) => getM(b) - getM(a));
+
+  const ROW = 28; const H = ROW * 3 + 14;
+  svg.setAttribute('height', H);
+  svg.setAttribute('width', W);
+
+  let html = '';
+  html += `<rect x="0" y="4" width="${W}" height="${ROW-2}" fill="#111820" rx="3" stroke="#1e2d3d" stroke-width="1"/>`;
+  html += `<text x="10" y="${4+ROW/2+4}" fill="#3d5a70" font-family="JetBrains Mono" font-size="11" pointer-events="none">root — ${mode} view — total: ${total.toFixed(2)} ms</text>`;
+
+  let x = 0;
+  fns.forEach(f => {
+    const m = getM(f);
+    if (m <= 0) return;
+    const bw = Math.max(1.5, (m / total) * W);
+    const color = getColor(f.name, mode, f);
+    const dimmed = search && !f.name.toLowerCase().includes(search) ? 1 : 0;
+    const hl = f.name === state.highlightedFn;
+    const y = ROW + 8;
+    const esc = f.name.replace(/'/g, "\\'");
+
+    html += `<rect x="${x.toFixed(1)}" y="${y}" width="${(bw-1).toFixed(1)}" height="${ROW-2}"
+      fill="${color}" fill-opacity="${dimmed ? 0.15 : 1}"
+      stroke="${hl ? 'rgba(255,255,255,0.9)' : 'rgba(0,0,0,0.35)'}" stroke-width="${hl ? 1.5 : 0.5}" rx="2"
+      data-fn="${f.name}"
+      onmouseenter="showTip(event,'${esc}')" onmouseleave="hideTip()" onclick="selectFn('${esc}')"/>`;
+
+    if (bw > 28) {
+      const chars = Math.floor((bw - 8) / 7);
+      const label = f.name.length > chars ? f.name.slice(0, chars - 1) + '…' : f.name;
+      html += `<text x="${(x+5).toFixed(1)}" y="${y+ROW/2+4}" fill="rgba(255,255,255,${dimmed ? 0.3 : 0.82})" font-size="11" font-family="JetBrains Mono" pointer-events="none">${label}</text>`;
+    }
+    x += bw;
+  });
+
+  svg.innerHTML = html;
+}
+
+// ═══════════════════════════════════════════
+//  TOOLTIP
+// ═══════════════════════════════════════════
+function showTip(e, name){ 
+  const f = state.functions[name];
+  if (!f) return;
+  const tt = document.getElementById('tooltip');
+  document.getElementById('tt-name').textContent = name;
+  const onPct = f.wall > 0 ? (f.oncpu / f.wall * 100).toFixed(1) : 0;
+  const offPct = f.wall > 0 ? (f.offcpu / f.wall * 100).toFixed(1) : 0;
+  document.getElementById('tt-wall').textContent = f.wall.toFixed(3) + ' ms';
+  document.getElementById('tt-on').textContent = f.oncpu.toFixed(3) + ` ms (${onPct}%)`;
+  document.getElementById('tt-off').textContent = f.offcpu.toFixed(3) + ` ms (${offPct}%)`;
+  document.getElementById('tt-io').textContent = 'IO ' + f.io.toFixed(2) + ' ms';
+  document.getElementById('tt-lock').textContent = 'Lock ' + f.lock.toFixed(2) + ' ms';
+  document.getElementById('tt-sleep').textContent = 'Sleep ' + f.sleep.toFixed(2) + ' ms';
+  document.getElementById('tt-sched').textContent = 'Sched ' + f.sched.toFixed(2) + ' ms';
+  tt.style.display = 'block';
+  moveTip(e);
+}
+function moveTip(e){
+  const tt = document.getElementById('tooltip');
+  let x = e.clientX + 14, y = e.clientY - 10;
+  if (x + 230 > window.innerWidth) x = e.clientX - 240;
+  if (y + 200 > window.innerHeight) y = e.clientY - 210;
+  tt.style.left = x + 'px'; tt.style.top = y + 'px';
+}
+function hideTip(){ 
+  document.getElementById('tooltip').style.display = 'none'; 
+}
+
+// ═══════════════════════════════════════════
+//  TABLE
+// ═══════════════════════════════════════════
+let _sCol = 'wall', _sDir = {wall: -1};
+
+function sortTable(col){
+  if (_sCol === col) _sDir[col] = (_sDir[col] || -1) * -1;
+  else { _sCol = col; _sDir[col] = -1; }
+  state.sortCol = col; state.sortDir = _sDir[col];
+  document.querySelectorAll('thead th').forEach(th => { th.classList.remove('sorted'); th.querySelector('.sa').textContent = '↕'; });
+  const th = document.querySelector(`thead th[data-col="${col}"]`);
+  if (th) { th.classList.add('sorted'); th.querySelector('.sa').textContent = state.sortDir < 0 ? '↓' : '↑'; }
+  renderTable();
+}
+
+function renderTable(){
+  const tbody = document.getElementById('fn-tbody');
+  let fns = Object.values(state.functions).filter(f => f.calls > 0);
+  const search = state.filterTbl.toLowerCase();
+  if (search) fns = fns.filter(f => f.name.toLowerCase().includes(search));
+
+  const top5 = Object.values(state.functions).filter(f => f.calls > 0).sort((a,b) => b.wall - a.wall).slice(0,5).map(f => f.name);
+  const isPct = state.timeMode === 'pct';
+  const maxW = Math.max(...fns.map(f => f.wall), 1);
+
+  const colMap = {name:'name',calls:'calls',wall:'wall',oncpu:'oncpu',offcpu:'offcpu',eff:'eff_sum',io:'io',lock:'lock',sleep:'sleep',sched:'sched'};
+  const col = colMap[state.sortCol] || 'wall';
+
+  fns.sort((a,b) => {
+    const av = col === 'name' ? a.name : col === 'eff_sum' ? a.eff_sum / Math.max(a.calls,1) : a[col];
+    const bv = col === 'name' ? b.name : col === 'eff_sum' ? b.eff_sum / Math.max(b.calls,1) : b[col];
+    if (typeof av === 'string') return state.sortDir * av.localeCompare(bv);
+    return state.sortDir * (bv - av);
+  });
+
+  const fmt = ms => isPct ? (ms / maxW * 100).toFixed(1) + '%' : ms.toFixed(3) + ' ms';
+
+  if (!fns.length) {
+    tbody.innerHTML = `<tr><td colspan="10" style="text-align:center;padding:40px;color:var(--muted)">No functions match your filter.</td></tr>`;
+    return;
+  }
+
+  tbody.innerHTML = fns.map(f => {
+    const eff = f.eff_sum / Math.max(f.calls, 1);
+    const effPct = (eff * 100).toFixed(1);
+    const ec = eff > .6 ? 'var(--green)' : eff > .3 ? 'var(--yellow)' : 'var(--red)';
+    const isTop = top5.includes(f.name);
+    const isHl = f.name === state.highlightedFn;
+    return `<tr class="${isTop ? 'top5' : ''} ${isHl ? 'highlighted' : ''}" onclick="selectFn('${f.name.replace(/'/g,"\\'")}')">
+      <td><span class="fn-name">${f.name}</span></td>
+      <td>${f.calls.toLocaleString()}</td>
+      <td class="metric-wall">${fmt(f.wall)}</td>
+      <td class="metric-on">${fmt(f.oncpu)}</td>
+      <td class="metric-off">${fmt(f.offcpu)}</td>
+      <td><div class="eff-bar"><div class="eff-track"><div class="eff-fill" style="width:${effPct}%;background:${ec}"></div></div><span style="color:${ec};font-size:11px">${effPct}%</span></div></td>
+      <td class="metric-io">${fmt(f.io)}</td>
+      <td class="metric-lock">${fmt(f.lock)}</td>
+      <td class="metric-sleep">${fmt(f.sleep)}</td>
+      <td class="metric-sched">${fmt(f.sched)}</td>
+    </tr>`;
+  }).join('');
+}
+
+// ═══════════════════════════════════════════
+//  CONTROLS
+// ═══════════════════════════════════════════
+function setFgMode(mode){
+  state.fgMode = mode;
+  document.querySelectorAll('.toggle-btn').forEach(b => b.classList.remove('active'));
+  document.querySelector(`.toggle-btn[data-mode="${mode}"]`).classList.add('active');
+  renderFlamegraph();
+}
+function filterFg(v){ state.filterFg = v; renderFlamegraph(); }
+function filterTable(v){ state.filterTbl = v; renderTable(); }
+function setTimeMode(mode, btn){ state.timeMode = mode; document.querySelectorAll('#time-mode-toggle .seg-btn').forEach(b => b.classList.remove('active')); btn.classList.add('active'); renderTable(); }
+function setRange(r, btn){ state.timeRange = r; document.querySelectorAll('#time-range .seg-btn').forEach(b => b.classList.remove('active')); btn.classList.add('active'); }
+function selectFn(name){ state.highlightedFn = state.highlightedFn === name ? null : name; renderFlamegraph(); renderTable(); }
+
+document.getElementById('btn-pause').addEventListener('click', () => {
+  const isPausing = !state.paused;
+  const cmd = isPausing ? 'pause' : 'resume';
+
+  fetch('/control', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ command: cmd })
+  })
+  .then(() => {
+    state.paused = isPausing;
+    const btn = document.getElementById('btn-pause');
+    const badge = document.getElementById('hdr-status');
+    const textEl = document.getElementById('status-text');
+
+    if (state.paused) {
+      btn.textContent = '▶ Resume';
+      badge.className = 'status-badge paused';
+      textEl.textContent = 'Paused';
+    } else {
+      btn.textContent = '⏸ Pause';
+      badge.className = 'status-badge';
+      textEl.textContent = 'Connected';
+    }
+  })
+  .catch(() => console.warn("Could not reach backend"));
+});
+
+document.getElementById('btn-clear').addEventListener('click', () => {
+  state.functions = {}; state.events = [];
+  state.stats = {entries:0, exits:0, offcpu:0, oncpu:0, processed:0, dropped:0, errors:0};
+  Object.keys(colorCache).forEach(k => delete colorCache[k]);
+  renderAll();
+});
+
+document.getElementById('btn-export-csv').addEventListener('click', () => {
+  const rows = Object.values(state.functions).map(f => {
+    const eff = (f.eff_sum / Math.max(f.calls,1) * 100).toFixed(1);
+    return [f.name, f.calls, f.wall.toFixed(3), f.oncpu.toFixed(3), f.offcpu.toFixed(3), eff + '%', f.io.toFixed(3), f.lock.toFixed(3), f.sleep.toFixed(3), f.sched.toFixed(3)].join(',');
+  });
+  const csv = 'Function,Calls,Wall(ms),OnCPU(ms),OffCPU(ms),Efficiency,IO(ms),Lock(ms),Sleep(ms),Sched(ms)\n' + rows.join('\n');
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([csv], {type: 'text/csv'}));
+  a.download = 'ebpf_profiler.csv'; a.click();
+});
+
+document.getElementById('btn-export-svg').addEventListener('click', () => {
+  const svg = document.getElementById('flamegraph-svg');
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([svg.outerHTML], {type: 'image/svg+xml'}));
+  a.download = 'flamegraph.svg'; a.click();
+});
+
+// ═══════════════════════════════════════════
+//  RENDER LOOP
+// ═══════════════════════════════════════════
+function renderAll(){
+  renderFlamegraph();
+  renderTable();
+  updateBreakdown();
+  updateStats();
+  updateHeader();
+}
+
+// ═══════════════════════════════════════════
+//  START EVERYTHING
+// ═══════════════════════════════════════════
+setInterval(fetchData, 300);
+setInterval(renderAll, 300);
+fetchData();   // initial fetch
+</script>
+</body>
+</html>
