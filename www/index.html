@@ -594,9 +594,9 @@ function updateHeader(){
   }
 }
 
-// ══════════════════════════════════════════════════════
-// REAL STACKED FLAMEGRAPH RENDERER (loads folded files)
-// ══════════════════════════════════════════════════════
+// ═══════════════════════════════════════════
+//  FIXED NESTED FLAMEGRAPH
+// ═══════════════════════════════════════════
 let currentFoldedData = {};
 
 function loadFoldedFile(mode) {
@@ -607,141 +607,96 @@ function loadFoldedFile(mode) {
       currentFoldedData[mode] = parseFolded(text);
       renderFlamegraph();
     })
-    .catch(() => {
-      currentFoldedData[mode] = [];
-      renderFlamegraph();
-    });
+    .catch(() => renderFlamegraph());
 }
 
 function parseFolded(text) {
   const lines = text.trim().split('\n');
   const root = { name: "root", value: 0, children: {} };
-  let total = 0;
 
   lines.forEach(line => {
     if (!line.trim()) return;
     const [stackStr, valueStr] = line.split(' ');
     const value = parseFloat(valueStr) || 0;
-    total += value;
+    if (!value) return;
 
     const stack = stackStr.split(';');
     let node = root;
     stack.forEach((name, i) => {
-      if (!node.children[name]) {
-        node.children[name] = { name, value: 0, children: {} };
-      }
+      if (!node.children[name]) node.children[name] = { name, value: 0, children: {} };
       node = node.children[name];
       if (i === stack.length - 1) node.value += value;
     });
   });
 
-  function flatten(node) {
-    const children = Object.values(node.children).map(flatten);
-    return {
-      name: node.name,
-      value: node.value,
-      children: children.length ? children : undefined
-    };
+  function toTree(node) {
+    const children = Object.values(node.children)
+      .map(toTree)
+      .sort((a, b) => b.value - a.value);
+    return { name: node.name, value: node.value, children: children.length ? children : undefined };
   }
-
-  return flatten(root);
+  return toTree(root);
 }
 
-// Consistent hash-based color for each unique function name
 function getFlameColor(name) {
   let hash = 0;
-  for (let i = 0; i < name.length; i++) {
-    hash = name.charCodeAt(i) + ((hash << 5) - hash);
-  }
-  const hue = Math.abs(hash) % 360;
-  return `hsl(${hue}, 85%, 55%)`;
+  for (let i = 0; i < name.length; i++) hash = name.charCodeAt(i) + ((hash << 5) - hash);
+  return `hsl(${Math.abs(hash) % 360}, 85%, 55%)`;
 }
 
-// Flamegraph renderer (real stacked, clickable)
 function renderFlamegraph() {
   const svg = document.getElementById('flamegraph-svg');
   const wrap = document.getElementById('flamegraph-canvas-wrap');
-  const W = wrap.clientWidth - 20;
+  const W = wrap.clientWidth - 20 || 800;
   const mode = state.fgMode;
-  const search = state.filterFg.toLowerCase();
 
   let data;
   if (mode === 'wall') {
-    const totalWall = Object.values(state.functions).reduce((sum, f) => sum + (f.wall || 0), 0);
-    data = { 
-      name: "root", 
-      value: totalWall,
-      children: Object.values(state.functions).map(f => ({
-        name: f.name,
-        value: f.wall || 0,
-        children: []
-      }))
-    };
+    const total = Object.values(state.functions).reduce((sum, f) => sum + (f.wall || 0), 0);
+    data = { name: "root", value: total, children: Object.values(state.functions).map(f => ({name: f.name, value: f.wall || 0})).sort((a,b)=>b.value-a.value) };
   } else {
-    // Fallback so On-CPU and Off-CPU tabs show something even if folded files are empty
-    const field = mode === 'oncpu' ? 'oncpu' : 'offcpu';
-    const total = Object.values(state.functions).reduce((sum, f) => sum + (f[field] || 0), 0);
-    data = { 
-      name: "root", 
-      value: total,
-      children: Object.values(state.functions).map(f => ({
-        name: f.name,
-        value: f[field] || 0,
-        children: []
-      }))
-    };
+    data = currentFoldedData[mode];
   }
 
-  if (!data.children || data.children.length === 0) {
-    svg.innerHTML = `<text x="${W/2}" y="134" text-anchor="middle" fill="#2a3f52" font-family="JetBrains Mono" font-size="13">No data in ${mode}.folded yet...</text>`;
-    svg.setAttribute('height', 268);
+  if (!data || !data.children || data.children.length === 0) {
+    svg.innerHTML = `<text x="${W/2}" y="140" text-anchor="middle" fill="#64748b" font-size="14">No data in ${mode}.folded yet...</text>`;
+    svg.setAttribute('height', 280);
     return;
   }
 
-  // Simple recursive flame renderer (stacked, zoomable on click)
   let html = '';
-  const ROW_HEIGHT = 18;
-  const totalHeight = 400;
+  const ROW_H = 20;
+  const MAX_H = 520;
 
-  function drawNode(node, x, width, depth) {
+  function draw(node, x, width, depth) {
     if (width < 1) return;
-
-    // Calculate y from bottom up (classic flamegraph style)
-    const y = totalHeight - (depth + 1) * ROW_HEIGHT - 4;
+    const y = MAX_H - (depth + 1) * ROW_H - 4;
 
     const color = depth === 0 ? '#1a2330' : getFlameColor(node.name);
+    html += `<rect x="${x}" y="${y}" width="${width}" height="${ROW_H-2}" rx="2" fill="${color}" stroke="#0f1824" onclick="zoomFlame(this)" data-name="${node.name}"/>`;
 
-    html += `<rect x="${x}" y="${y}" width="${width}" height="${ROW_HEIGHT}" 
-      fill="${color}" stroke="#1e2d3d" stroke-width="1" rx="1"
-      onclick="zoomFlame(this)" data-name="${node.name}" data-x="${x}" data-w="${width}"/>`;
-
-    if (width > 25) {
-      const label = node.name.length > 22 ? node.name.substring(0,19) + '…' : node.name;
-      const textX = x + 4;
-      html += `<text x="${textX}" y="${y + ROW_HEIGHT/2 + 5}" fill="#fff" font-size="10" font-family="JetBrains Mono" pointer-events="none">${label}</text>`;
+    if (width > 35) {
+      const label = node.name.length > 32 ? node.name.substring(0,29)+'…' : node.name;
+      html += `<text x="${x+4}" y="${y+ROW_H/2+6}" fill="#fff" font-size="10" font-family="JetBrains Mono">${label}</text>`;
     }
 
     if (node.children) {
-      let childX = x;
-      // Sort children by value (largest first - classic flamegraph order)
-      const sortedChildren = [...node.children].sort((a, b) => b.value - a.value);
-      sortedChildren.forEach(child => {
-        const childW = (child.value / node.value) * width || 0;
-        drawNode(child, childX, childW, depth + 1);
-        childX += childW;
+      let cx = x;
+      node.children.forEach(child => {
+        const cw = (child.value / node.value) * width || 0;
+        draw(child, cx, cw, depth + 1);
+        cx += cw;
       });
     }
   }
 
-  drawNode(data, 0, W, 0);
-
+  draw(data, 0, W, 0);
   svg.innerHTML = html;
-    svg.setAttribute('height', totalHeight);
+  svg.setAttribute('height', MAX_H);
 }
 
 function zoomFlame(el) {
-  const name = el.getAttribute('data-name');
-  state.highlightedFn = name;
+  state.highlightedFn = el.getAttribute('data-name');
   renderFlamegraph();
   renderTable();
 }
@@ -884,7 +839,6 @@ function renderTable(){
 // ═══════════════════════════════════════════
 //  CONTROLS
 // ═══════════════════════════════════════════
-// Load folded files when switching tabs
 function setFgMode(mode) {
   state.fgMode = mode;
   document.querySelectorAll('.toggle-btn').forEach(b => b.classList.remove('active'));
@@ -968,7 +922,7 @@ function renderAll(){
 // ═══════════════════════════════════════════
 setInterval(fetchData, 300);
 setInterval(renderAll, 300);
-fetchData();   // initial fetch
+fetchData();
 </script>
 </body>
 </html>
