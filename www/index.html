@@ -526,25 +526,11 @@ function fetchData() {
   fetch('/data')
     .then(r => r.json())
     .then(data => {
-      // PID + binary (will be added in C++ soon)
+      // PID + binary
       if (data.pid) state.pid = data.pid;
       if (data.binary) state.binary = data.binary;
 
-      if (data.start_ns) {
-        const runtimeSec = data.runtime_sec || ((Date.now() / 1000) - (data.start_ns / 1e9));
-        document.getElementById('hdr-runtime').textContent = runtimeSec.toFixed(1) + 's';
-      }
-
-      // Update stats from backend
-      if (data.entries !== undefined) state.stats.entries = data.entries;
-      if (data.exits !== undefined)   state.stats.exits = data.exits;
-      if (data.oncpu_samples !== undefined) state.stats.oncpu = data.oncpu_samples;
-      if (data.processed !== undefined) state.stats.processed = data.processed;
-      if (data.dropped !== undefined)   state.stats.dropped = data.dropped;
-      if (data.errors !== undefined)    state.stats.errors = data.errors;
-
-      // Transform functions object into the format the UI expects
-      if (data.functions && typeof data.functions === 'object') {
+      if (data.functions) {
         state.functions = {};
         Object.keys(data.functions).forEach(name => {
           const f = data.functions[name];
@@ -562,9 +548,21 @@ function fetchData() {
             lock: f.lock || 0,
             sleep: f.sleep || 0,
             sched: f.sched || 0,
-            eff_sum: calls * (wall > 0 ? oncpu / wall : 0)   // calculate efficiency
+            eff_sum: calls * (wall > 0 ? oncpu / wall : 0)
           };
         });
+      }
+
+      // Update stats from backend
+      if (data.entries !== undefined) state.stats.entries = data.entries;
+      if (data.exits !== undefined) state.stats.exits = data.exits;
+      if (data.oncpu_samples !== undefined) state.stats.oncpu = data.oncpu_samples;
+      if (data.processed !== undefined) state.stats.processed = data.processed;
+      if (data.dropped !== undefined) state.stats.dropped = data.dropped;
+      if (data.errors !== undefined) state.stats.errors = data.errors;
+
+      if (data.runtime_sec !== undefined) {
+        state.runtime_sec = data.runtime_sec;
       }
 
       renderAll();
@@ -582,6 +580,170 @@ function updateHeader(){
   document.getElementById('hdr-entries').textContent = state.stats.entries.toLocaleString();
   document.getElementById('hdr-exits').textContent = state.stats.exits.toLocaleString();
   document.getElementById('hdr-samples').textContent = state.stats.oncpu.toLocaleString();
+
+  // Show real runtime from backend
+  if (state.runtime_sec !== undefined) {
+    document.getElementById('hdr-runtime').textContent = state.runtime_sec.toFixed(1) + 's';
+  }
+
+  if (Object.keys(state.functions).length > 0) {
+    const statusEl = document.getElementById('hdr-status');
+    const textEl = document.getElementById('status-text');
+    statusEl.className = 'status-badge';
+    textEl.textContent = 'Connected';
+  }
+}
+
+// ══════════════════════════════════════════════════════
+// REAL STACKED FLAMEGRAPH RENDERER (loads folded files)
+// ══════════════════════════════════════════════════════
+let currentFoldedData = {};
+
+function loadFoldedFile(mode) {
+  const filename = mode === 'oncpu' ? '/on_cpu.folded' : '/off_cpu.folded';
+  fetch(filename)
+    .then(r => r.text())
+    .then(text => {
+      currentFoldedData[mode] = parseFolded(text);
+      renderFlamegraph();
+    })
+    .catch(() => {
+      currentFoldedData[mode] = [];
+      renderFlamegraph();
+    });
+}
+
+function parseFolded(text) {
+  const lines = text.trim().split('\n');
+  const root = { name: "root", value: 0, children: {} };
+  let total = 0;
+
+  lines.forEach(line => {
+    if (!line.trim()) return;
+    const [stackStr, valueStr] = line.split(' ');
+    const value = parseFloat(valueStr) || 0;
+    total += value;
+
+    const stack = stackStr.split(';');
+    let node = root;
+    stack.forEach((name, i) => {
+      if (!node.children[name]) {
+        node.children[name] = { name, value: 0, children: {} };
+      }
+      node = node.children[name];
+      if (i === stack.length - 1) node.value += value;
+    });
+  });
+
+  function flatten(node) {
+    const children = Object.values(node.children).map(flatten);
+    return {
+      name: node.name,
+      value: node.value,
+      children: children.length ? children : undefined
+    };
+  }
+
+  return flatten(root);
+}
+
+// Consistent hash-based color for each unique function name
+function getFlameColor(name) {
+  let hash = 0;
+  for (let i = 0; i < name.length; i++) {
+    hash = name.charCodeAt(i) + ((hash << 5) - hash);
+  }
+  const hue = Math.abs(hash) % 360;
+  return `hsl(${hue}, 85%, 55%)`;
+}
+
+// Flamegraph renderer (real stacked, clickable)
+function renderFlamegraph() {
+  const svg = document.getElementById('flamegraph-svg');
+  const wrap = document.getElementById('flamegraph-canvas-wrap');
+  const W = wrap.clientWidth - 20;
+  const mode = state.fgMode;
+  const search = state.filterFg.toLowerCase();
+
+  let data;
+  if (mode === 'wall') {
+    const totalWall = Object.values(state.functions).reduce((sum, f) => sum + (f.wall || 0), 0);
+    data = { 
+      name: "root", 
+      value: totalWall,
+      children: Object.values(state.functions).map(f => ({
+        name: f.name,
+        value: f.wall || 0,
+        children: []
+      }))
+    };
+  } else {
+    // Fallback so On-CPU and Off-CPU tabs show something even if folded files are empty
+    const field = mode === 'oncpu' ? 'oncpu' : 'offcpu';
+    const total = Object.values(state.functions).reduce((sum, f) => sum + (f[field] || 0), 0);
+    data = { 
+      name: "root", 
+      value: total,
+      children: Object.values(state.functions).map(f => ({
+        name: f.name,
+        value: f[field] || 0,
+        children: []
+      }))
+    };
+  }
+
+  if (!data.children || data.children.length === 0) {
+    svg.innerHTML = `<text x="${W/2}" y="134" text-anchor="middle" fill="#2a3f52" font-family="JetBrains Mono" font-size="13">No data in ${mode}.folded yet...</text>`;
+    svg.setAttribute('height', 268);
+    return;
+  }
+
+  // Simple recursive flame renderer (stacked, zoomable on click)
+  let html = '';
+  const ROW_HEIGHT = 18;
+  const totalHeight = 400;
+
+  function drawNode(node, x, width, depth) {
+    if (width < 1) return;
+
+    // Calculate y from bottom up (classic flamegraph style)
+    const y = totalHeight - (depth + 1) * ROW_HEIGHT - 4;
+
+    const color = depth === 0 ? '#1a2330' : getFlameColor(node.name);
+
+    html += `<rect x="${x}" y="${y}" width="${width}" height="${ROW_HEIGHT}" 
+      fill="${color}" stroke="#1e2d3d" stroke-width="1" rx="1"
+      onclick="zoomFlame(this)" data-name="${node.name}" data-x="${x}" data-w="${width}"/>`;
+
+    if (width > 25) {
+      const label = node.name.length > 22 ? node.name.substring(0,19) + '…' : node.name;
+      const textX = x + 4;
+      html += `<text x="${textX}" y="${y + ROW_HEIGHT/2 + 5}" fill="#fff" font-size="10" font-family="JetBrains Mono" pointer-events="none">${label}</text>`;
+    }
+
+    if (node.children) {
+      let childX = x;
+      // Sort children by value (largest first - classic flamegraph order)
+      const sortedChildren = [...node.children].sort((a, b) => b.value - a.value);
+      sortedChildren.forEach(child => {
+        const childW = (child.value / node.value) * width || 0;
+        drawNode(child, childX, childW, depth + 1);
+        childX += childW;
+      });
+    }
+  }
+
+  drawNode(data, 0, W, 0);
+
+  svg.innerHTML = html;
+    svg.setAttribute('height', totalHeight);
+}
+
+function zoomFlame(el) {
+  const name = el.getAttribute('data-name');
+  state.highlightedFn = name;
+  renderFlamegraph();
+  renderTable();
 }
 
 // ═══════════════════════════════════════════
@@ -623,84 +785,6 @@ function updateStats(){
     const el = document.getElementById('st-' + k);
     if (el) el.textContent = (s[k] || 0).toLocaleString();
   });
-}
-
-// ═══════════════════════════════════════════
-//  FLAMEGRAPH
-// ═══════════════════════════════════════════
-const colorCache = {};
-function getColor(name, mode, f) {
-  const key = name + mode;
-  if (!colorCache[key]) {
-    if (mode === 'wall') {
-      const e = (f.eff_sum || 0) / Math.max(f.calls, 1);
-      colorCache[key] = e > .65 ? '#047857' : e > .35 ? '#0e7490' : '#0f766e';
-    } else if (mode === 'oncpu') {
-      const blues = ['#1d4ed8','#2563eb','#1e40af','#1e3a8a'];
-      colorCache[key] = blues[name.length % blues.length];
-    } else {
-      const r = f.offcpu || 1;
-      if (f.lock / r > .4) colorCache[key] = '#dc2626';
-      else if (f.io / r > .4) colorCache[key] = '#d97706';
-      else if (f.sleep / r > .4) colorCache[key] = '#7c3aed';
-      else colorCache[key] = '#475569';
-    }
-  }
-  return colorCache[key];
-}
-
-function renderFlamegraph(){
-  const svg = document.getElementById('flamegraph-svg');
-  const wrap = document.getElementById('flamegraph-canvas-wrap');
-  const W = wrap.clientWidth - 20;
-  const mode = state.fgMode;
-  const search = state.filterFg.toLowerCase();
-
-  const fns = Object.values(state.functions).filter(f => f.calls > 0);
-  if (!fns.length) {
-    svg.innerHTML = `<text x="${W/2}" y="134" text-anchor="middle" fill="#2a3f52" font-family="JetBrains Mono" font-size="13">Waiting for profiler events…</text>`;
-    svg.setAttribute('height', 268);
-    return;
-  }
-
-  const getM = f => mode === 'wall' ? f.wall : mode === 'oncpu' ? f.oncpu : f.offcpu;
-  const total = fns.reduce((s, f) => s + getM(f), 0) || 1;
-  fns.sort((a, b) => getM(b) - getM(a));
-
-  const ROW = 28; const H = ROW * 3 + 14;
-  svg.setAttribute('height', H);
-  svg.setAttribute('width', W);
-
-  let html = '';
-  html += `<rect x="0" y="4" width="${W}" height="${ROW-2}" fill="#111820" rx="3" stroke="#1e2d3d" stroke-width="1"/>`;
-  html += `<text x="10" y="${4+ROW/2+4}" fill="#3d5a70" font-family="JetBrains Mono" font-size="11" pointer-events="none">root — ${mode} view — total: ${total.toFixed(2)} ms</text>`;
-
-  let x = 0;
-  fns.forEach(f => {
-    const m = getM(f);
-    if (m <= 0) return;
-    const bw = Math.max(1.5, (m / total) * W);
-    const color = getColor(f.name, mode, f);
-    const dimmed = search && !f.name.toLowerCase().includes(search) ? 1 : 0;
-    const hl = f.name === state.highlightedFn;
-    const y = ROW + 8;
-    const esc = f.name.replace(/'/g, "\\'");
-
-    html += `<rect x="${x.toFixed(1)}" y="${y}" width="${(bw-1).toFixed(1)}" height="${ROW-2}"
-      fill="${color}" fill-opacity="${dimmed ? 0.15 : 1}"
-      stroke="${hl ? 'rgba(255,255,255,0.9)' : 'rgba(0,0,0,0.35)'}" stroke-width="${hl ? 1.5 : 0.5}" rx="2"
-      data-fn="${f.name}"
-      onmouseenter="showTip(event,'${esc}')" onmouseleave="hideTip()" onclick="selectFn('${esc}')"/>`;
-
-    if (bw > 28) {
-      const chars = Math.floor((bw - 8) / 7);
-      const label = f.name.length > chars ? f.name.slice(0, chars - 1) + '…' : f.name;
-      html += `<text x="${(x+5).toFixed(1)}" y="${y+ROW/2+4}" fill="rgba(255,255,255,${dimmed ? 0.3 : 0.82})" font-size="11" font-family="JetBrains Mono" pointer-events="none">${label}</text>`;
-    }
-    x += bw;
-  });
-
-  svg.innerHTML = html;
 }
 
 // ═══════════════════════════════════════════
@@ -800,12 +884,15 @@ function renderTable(){
 // ═══════════════════════════════════════════
 //  CONTROLS
 // ═══════════════════════════════════════════
-function setFgMode(mode){
+// Load folded files when switching tabs
+function setFgMode(mode) {
   state.fgMode = mode;
   document.querySelectorAll('.toggle-btn').forEach(b => b.classList.remove('active'));
   document.querySelector(`.toggle-btn[data-mode="${mode}"]`).classList.add('active');
+  if (mode !== 'wall') loadFoldedFile(mode);
   renderFlamegraph();
 }
+
 function filterFg(v){ state.filterFg = v; renderFlamegraph(); }
 function filterTable(v){ state.filterTbl = v; renderTable(); }
 function setTimeMode(mode, btn){ state.timeMode = mode; document.querySelectorAll('#time-mode-toggle .seg-btn').forEach(b => b.classList.remove('active')); btn.classList.add('active'); renderTable(); }
@@ -841,7 +928,7 @@ document.getElementById('btn-pause').addEventListener('click', () => {
 });
 
 document.getElementById('btn-clear').addEventListener('click', () => {
-  state.functions = {}; state.events = [];
+  state.functions = {};
   state.stats = {entries:0, exits:0, offcpu:0, oncpu:0, processed:0, dropped:0, errors:0};
   Object.keys(colorCache).forEach(k => delete colorCache[k]);
   renderAll();

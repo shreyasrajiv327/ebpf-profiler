@@ -910,6 +910,8 @@ int main(int argc, char **argv)
             res.set_content(live_data.dump(), "application/json");
         });
 
+        svr.set_mount_point("/", ".");
+
         // NEW: Control endpoint for Pause/Resume
         svr.Post("/control", [](const httplib::Request& req, httplib::Response& res) {
             auto body = json::parse(req.body);
