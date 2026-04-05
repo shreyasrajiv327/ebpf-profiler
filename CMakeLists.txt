@@ -106,6 +106,7 @@ add_dependencies(profiler bpf_objects)
 target_include_directories(profiler PRIVATE
     ${CMAKE_SOURCE_DIR}/kernel
     ${LIBBPF_INCLUDE}
+    ${CMAKE_SOURCE_DIR}/include
 )
 
 target_link_libraries(profiler PRIVATE
@@ -127,4 +128,12 @@ add_custom_command(TARGET profiler POST_BUILD
         ${CMAKE_BINARY_DIR}/uprobe.bpf.o
         ${CMAKE_BINARY_DIR}/
     COMMENT "Copying all BPF objects to build directory"
+)
+
+# Copy www folder so the frontend works
+add_custom_command(TARGET profiler POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        ${CMAKE_SOURCE_DIR}/www
+        ${CMAKE_BINARY_DIR}/www
+    COMMENT "Copying www/ folder (for live frontend)"
 )
