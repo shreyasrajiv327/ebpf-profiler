@@ -65,4 +65,16 @@ private:
         const std::vector<OffCpuPeriod>& periods);
     
     void handle_error(const std::string& msg, uint32_t tid);
+    // Add to private section of DerivationEngine:
+struct PendingExit {
+    uint32_t tid;
+    FunctionExecution exec;
+    profiler_event exit_evt;
+    uint64_t queued_at_ns;  // monotonic ns when exit was received
+};
+std::vector<PendingExit> pending_exits_;
+static constexpr uint64_t FLUSH_GRACE_NS = 5'000'000ULL; // 5ms grace window
+
+public:
+    void flush_pending(uint64_t now_ns);  // call after all rb polls
 };

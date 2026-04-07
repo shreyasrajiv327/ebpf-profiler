@@ -45,29 +45,34 @@ void DerivationEngine::process_function_exit(const profiler_event& evt)
 {
     total_events_processed_++;
     auto it = timelines_.find(evt.tid);
-    if (it == timelines_.end()) {
-        handle_error("Function exit without timeline", evt.tid);
-        return;
-    }
+    if (it == timelines_.end()) { handle_error("exit without timeline", evt.tid); return; }
 
     auto& timeline = it->second;
-    if (timeline.call_stack.empty()) {
-        handle_error("Function exit without entry", evt.tid);
-        return;
-    }
+    if (timeline.call_stack.empty()) { handle_error("exit without entry", evt.tid); return; }
 
     FunctionExecution exec = timeline.call_stack.back();
     timeline.call_stack.pop_back();
 
-    // DEBUG: Check if entry_ts is reasonable
-    if (exec.entry_ts == 0) {
-        handle_error("Entry timestamp was 0", evt.tid);
-    }
+    // Don't emit yet — queue it so offcpu events can still arrive
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint64_t now_ns = (uint64_t)ts.tv_sec * 1'000'000'000ULL + ts.tv_nsec;
 
-    derive_and_emit(evt.tid, exec, evt);
+    pending_exits_.push_back({evt.tid, std::move(exec), evt, now_ns});
     timeline.last_event_ts = evt.timestamp_ns;
 }
-
+void DerivationEngine::flush_pending(uint64_t now_ns)
+{
+    auto it = pending_exits_.begin();
+    while (it != pending_exits_.end()) {
+        if (now_ns - it->queued_at_ns >= FLUSH_GRACE_NS) {
+            derive_and_emit(it->tid, it->exec, it->exit_evt);
+            it = pending_exits_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
 /* ═══════════════════════════════════════════════════════════════════════
  *  Process Off-CPU Event
  * ═════════════════════════════════════════════════════════════════════*/
@@ -169,8 +174,19 @@ void DerivationEngine::derive_and_emit(uint32_t tid,
                 break;
         }
     }
+    if (total_off_cpu > wall_ns) {
+    // Scale down all buckets proportionally
+    double scale = (double)wall_ns / total_off_cpu;
+    io_ns    = (uint64_t)(io_ns    * scale);
+    lock_ns  = (uint64_t)(lock_ns  * scale);
+    sleep_ns = (uint64_t)(sleep_ns * scale);
+    sched_ns = (uint64_t)(sched_ns * scale);
+    total_off_cpu = wall_ns;
+}
 
-    uint64_t on_cpu_ns = (total_off_cpu < wall_ns) ? (wall_ns - total_off_cpu) : 0;
+uint64_t on_cpu_ns = wall_ns - total_off_cpu;
+
+    //uint64_t on_cpu_ns = (total_off_cpu < wall_ns) ? (wall_ns - total_off_cpu) : 0;
 
     DerivedFunctionMetrics metrics;
     metrics.func_id = exec.func_id;

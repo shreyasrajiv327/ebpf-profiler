@@ -51,3 +51,4 @@ compile_commands.json
 # OS
 .DS_Store
 Thumbs.db
+test/demo_app.cpp

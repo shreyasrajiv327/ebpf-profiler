@@ -34,12 +34,9 @@ extern "C" void do_sleep_work() {
 }
 
 extern "C" void do_io_work() {
-    // File I/O (will generate real block I/O events)
-    std::lock_guard<std::mutex> guard(global_lock);  // extra contention
     std::ofstream f("demo_io.log", std::ios::app);
     if (f) {
-        f << "IO[" << getpid() << ":" << std::this_thread::get_id() << "] t=" 
-          << std::chrono::system_clock::now().time_since_epoch().count() << "\n";
+        f << "IO " << getpid() << "\n";
     }
 }
 

@@ -532,8 +532,8 @@ int main(int argc, char **argv)
     for (auto &f : g_func_names) printf("    - %s\n", f.c_str());
 
     /* Open folded stack files */
-    g_oncpu_folded.open("on_cpu.folded",   std::ios::out | std::ios::app);
-    g_offcpu_folded.open("off_cpu.folded", std::ios::out | std::ios::app);
+    g_oncpu_folded.open("../www/on_cpu.folded",   std::ios::out | std::ios::app);
+    g_offcpu_folded.open("../www/off_cpu.folded", std::ios::out | std::ios::app);
 
     /* Init derivation engine */
     g_derivation = new DerivationEngine(on_derived_metrics);
@@ -650,23 +650,33 @@ int main(int argc, char **argv)
 
     struct perf_event_attr pea = {};
     pea.type          = PERF_TYPE_SOFTWARE;
-    pea.config        = PERF_COUNT_SW_CPU_CLOCK;
-    pea.sample_period = 2000000ULL;  /* ~500 Hz */
+    pea.config        = PERF_COUNT_SW_TASK_CLOCK;   // ← CHANGED (better for per-process)
+    pea.sample_period = 500000ULL;                  // ← CHANGED (~2000 Hz)
     pea.wakeup_events = 1;
 
     for (int cpu = 0; cpu < nr_cpus && cpu < 128; cpu++) {
         int pfd = syscall(__NR_perf_event_open, &pea, (pid_t)g_target_pid, cpu, -1, 0);
-        if (pfd < 0) continue;
+        if (pfd < 0) {
+            // printf("  [skip] perf_event_open on CPU %d failed: %s\n", cpu, strerror(errno));
+            continue;
+        }
         struct bpf_link *link = bpf_program__attach_perf_event(oncpu_prog, pfd);
-        if (link) oncpu_attached = true;
-        else      close(pfd);
+        if (link) {
+            oncpu_attached = true;
+            // printf("  [ OK ] on-CPU sampling on CPU %d\n", cpu);
+        } else {
+            close(pfd);
+            // printf("  [FAIL] attach on CPU %d: %s\n", cpu, strerror(errno));
+        }
     }
 
     if (!oncpu_attached) {
-        fprintf(stderr, "Failed to attach on-CPU sampler on any CPU\n");
-        cleanup(); return 1;
+        fprintf(stderr, "WARNING: Failed to attach on-CPU sampler on any CPU\n");
+        fprintf(stderr, "         On-CPU Samples will stay at 0 (but derivation still works)\n");
+    } else {
+        printf("  [ OK ] on-CPU sampling (~2000 Hz, %d CPUs)\n", nr_cpus);
     }
-    printf("  [ OK ] on-CPU sampling (~500 Hz, %d CPUs)\n", nr_cpus);
+
 
     /* ── Ring buffers — BUG FIX #5: separate callbacks ── */
     struct bpf_map *urb  = bpf_object__find_map_by_name(g_uprobe_obj, "events");
@@ -741,12 +751,17 @@ int main(int argc, char **argv)
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
 
     /* Main poll loop */
-    time_t last_print = time(nullptr);
+ time_t last_print = time(nullptr);
     while (g_running) {
         if (!g_paused) {
-            ring_buffer__poll(g_uprobe_rb, 50);
-            ring_buffer__poll(g_offcpu_rb, 50);
-            ring_buffer__poll(g_oncpu_rb, 50);
+            ring_buffer__poll(g_uprobe_rb, 10);
+            ring_buffer__poll(g_offcpu_rb, 10);
+            ring_buffer__poll(g_oncpu_rb,  10);
+
+            struct timespec ts;
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            uint64_t now_ns = (uint64_t)ts.tv_sec * 1'000'000'000ULL + ts.tv_nsec;
+            g_derivation->flush_pending(now_ns);
         } else {
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
@@ -756,31 +771,30 @@ int main(int argc, char **argv)
             print_table();
             if (g_stack_resolver) g_stack_resolver->refresh_maps();
 
-            /* === UPDATE WEB UI LIVE DATA (this makes header match terminal) === */
+            /* === UPDATE WEB UI LIVE DATA (THIS BLOCK WAS UPDATED) === */
             {
                 std::lock_guard<std::mutex> lock(data_mutex);
 
-                // Real profiler start time + runtime
                 struct timespec ts;
                 clock_gettime(CLOCK_MONOTONIC, &ts);
                 uint64_t now_ns = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
-                live_data["start_ns"] = g_profiler_start_ns;
-                live_data["runtime_sec"] = (now_ns - g_profiler_start_ns) / 1e9;
 
-                // Global counters (exactly what the terminal shows)
-                live_data["entries"] = g_total_func_entries.load();
-                live_data["exits"]   = g_total_func_exits.load();
-                live_data["oncpu_samples"] = g_total_on_cpu_samples.load();
+                live_data["start_ns"]     = g_profiler_start_ns;
+                live_data["runtime_sec"]  = (now_ns - g_profiler_start_ns) / 1e9;
 
-                // Derivation stats
-                live_data["processed"] = g_derivation->get_total_processed();
-                live_data["dropped"]   = g_derivation->get_dropped_short_calls();
-                live_data["errors"]    = g_derivation->get_error_count();
+                live_data["entries"]      = g_total_func_entries.load();
+                live_data["exits"]        = g_total_func_exits.load();
+                live_data["oncpu_samples"]= g_total_on_cpu_samples.load();
+                live_data["offcpu_events"]= g_total_off_cpu_events.load();   // ← NEW: This was missing!
 
-                // Also send PID + binary (so header shows correctly)
-                live_data["pid"] = g_target_pid;
-                std::string basename = g_binary_path.substr(g_binary_path.find_last_of('/') + 1);
-                live_data["binary"] = basename;
+                live_data["processed"]    = g_derivation->get_total_processed();
+                live_data["dropped"]      = g_derivation->get_dropped_short_calls();
+                live_data["errors"]       = g_derivation->get_error_count();
+
+                live_data["pid"]          = g_target_pid;
+                std::string basename = g_binary_path.empty() ? "unknown" 
+                                     : g_binary_path.substr(g_binary_path.find_last_of('/') + 1);
+                live_data["binary"]       = basename;
             }
             last_print = now;
         }
