@@ -73,8 +73,11 @@ int main(int argc, char** argv) {
         threads.emplace_back(worker_thread);
     }
 
-  
-    std::this_thread::sleep_for(std::chrono::seconds(duration_sec));
+    // Keep main thread active so perf_event pid-targeted sampling works
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(duration_sec);
+    while (std::chrono::steady_clock::now() < deadline && running) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
 
     running = false;
     for (auto& t : threads) t.join();

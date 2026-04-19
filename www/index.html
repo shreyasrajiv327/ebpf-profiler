@@ -580,38 +580,63 @@ function loadFoldedFile(mode) {
     .catch(() => renderFlamegraph());
 }
 
+function getFlameColor(name) {
+  // Better, more readable color palette
+  let hash = 0;
+  for (let i = 0; i < name.length; i++) {
+    hash = name.charCodeAt(i) + ((hash << 5) - hash);
+  }
+  const hue = Math.abs(hash) % 360;
+  
+  // High saturation + good brightness range for readability
+  return `hsl(${hue}, 88%, 62%)`;
+}
+
 function parseFolded(text) {
   const lines = text.trim().split('\n');
   const root = { name: "root", value: 0, children: {} };
 
   lines.forEach(line => {
     if (!line.trim()) return;
-    const [stackStr, valueStr] = line.split(' ');
-    const value = parseFloat(valueStr) || 0;
-    if (!value) return;
+    const parts = line.trim().split(' ');
+    if (parts.length < 2) return;
 
-    const stack = stackStr.split(';');
+    const stackStr = parts[0];
+    const value = parseFloat(parts[1]) || 0;
+    if (value <= 0) return;
+
+    let stack = stackStr.split(';');
+
+    // Skip the leading "root" if present (your files start with root;)
+    if (stack[0] === "root") stack = stack.slice(1);
+
     let node = root;
-    stack.forEach((name, i) => {
-      if (!node.children[name]) node.children[name] = { name, value: 0, children: {} };
+    stack.forEach(name => {
+      if (!name) return;
+      if (!node.children[name]) {
+        node.children[name] = { name: name, value: 0, children: {} };
+      }
       node = node.children[name];
-      if (i === stack.length - 1) node.value += value;
+      node.value += value;          // accumulate on every level
     });
+
+    // Also add to root so top-level width works
+    root.value += value;
   });
+
+  console.log(`✅ Parsed ${lines.length} folded lines → root.value = ${root.value}`);
 
   function toTree(node) {
     const children = Object.values(node.children)
       .map(toTree)
       .sort((a, b) => b.value - a.value);
-    return { name: node.name, value: node.value, children: children.length ? children : undefined };
+    return { 
+      name: node.name, 
+      value: node.value, 
+      children: children.length ? children : undefined 
+    };
   }
   return toTree(root);
-}
-
-function getFlameColor(name) {
-  let hash = 0;
-  for (let i = 0; i < name.length; i++) hash = name.charCodeAt(i) + ((hash << 5) - hash);
-  return `hsl(${Math.abs(hash) % 360}, 85%, 55%)`;
 }
 
 function renderFlamegraph() {
@@ -628,26 +653,29 @@ function renderFlamegraph() {
     data = currentFoldedData[mode];
   }
 
-  if (!data || !data.children || data.children.length === 0) {
-    svg.innerHTML = `<text x="${W/2}" y="140" text-anchor="middle" fill="#64748b" font-size="14">Waiting for ${mode} data...</text>`;
-    svg.setAttribute('height', 280);
+  if (!data || !data.children || data.children.length === 0 || data.value === 0) {
+    svg.innerHTML = `<text x="${W/2}" y="160" text-anchor="middle" fill="#64748b" font-size="15" font-family="JetBrains Mono">
+      Waiting for ${mode.toUpperCase()} data...<br>
+      <tspan x="${W/2}" dy="22" font-size="12" fill="#94a3b8">(Parsed ${data ? data.value : 0} µs)</tspan>
+    </text>`;
+    svg.setAttribute('height', 320);
     return;
   }
 
   let html = '';
   const ROW_H = 32;
-  const MAX_H = 720;
+  const MAX_H = 820;   // tall enough for your 12+ frame stacks
 
   function draw(node, x, width, depth) {
     if (width < 2) return;
-    const y = MAX_H - (depth + 1) * ROW_H - 4;
+    const y = MAX_H - (depth + 1) * ROW_H - 8;
 
     const color = depth === 0 ? '#1a2330' : getFlameColor(node.name);
-    html += `<rect x="${x}" y="${y}" width="${width}" height="${ROW_H-4}" rx="4" fill="${color}" stroke="#0f1824" onclick="zoomFlame(this)" data-name="${node.name}"/>`;
+    html += `<rect x="${x}" y="${y}" width="${width}" height="${ROW_H-6}" rx="4" fill="${color}" stroke="#0f1824" onclick="zoomFlame(this)" data-name="${node.name}"/>`;
 
-    if (width > 55) {
-      const label = node.name.length > 42 ? node.name.substring(0,39)+'…' : node.name;
-      html += `<text x="${x+8}" y="${y+ROW_H/2+10}" fill="#fff" font-size="12.5" font-family="JetBrains Mono">${label}</text>`;
+    if (width > 60) {
+      const label = node.name.length > 45 ? node.name.substring(0,42)+'…' : node.name;
+      html += `<text x="${x+8}" y="${y+ROW_H/2+9}" fill="#000" font-size="12.5" font-family="JetBrains Mono">${label}</text>`;
     }
 
     if (node.children) {
@@ -663,12 +691,6 @@ function renderFlamegraph() {
   draw(data, 0, W, 0);
   svg.innerHTML = html;
   svg.setAttribute('height', MAX_H);
-}
-
-function zoomFlame(el) {
-  state.highlightedFn = el.getAttribute('data-name');
-  renderFlamegraph();
-  renderTable();
 }
 
 function loadInitialFlamegraph() {
@@ -806,7 +828,12 @@ function setFgMode(mode) {
   state.fgMode = mode;
   document.querySelectorAll('.toggle-btn').forEach(b => b.classList.remove('active'));
   document.querySelector(`.toggle-btn[data-mode="${mode}"]`).classList.add('active');
-  if (mode !== 'wall') loadFoldedFile(mode);
+
+  if (mode !== 'wall') {
+    loadFoldedFile(mode);           // already there
+    // Extra: force refresh every time you switch tab
+    setTimeout(() => loadFoldedFile(mode), 300);
+  }
   renderFlamegraph();
 }
 

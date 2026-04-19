@@ -282,7 +282,7 @@ static void on_derived_metrics(const DerivedFunctionMetrics& metrics)
         if (g_oncpu_folded.is_open())  g_oncpu_folded.flush();
         if (g_offcpu_folded.is_open()) g_offcpu_folded.flush();
     }
- 
+
     // ── Update live JSON for Web UI ─────────────────────────────────
     {
         std::lock_guard<std::mutex> lock(data_mutex);
@@ -390,7 +390,7 @@ static void print_table()
     printf("  Function exits   : %llu\n", (unsigned long long)g_total_func_exits);
     printf("  Off-CPU events   : %llu\n", (unsigned long long)g_total_off_cpu_events);
 
-printf("  On-CPU samples   : %llu\n", g_total_on_cpu_samplesp);
+    printf("  On-CPU samples   : %llu\n", (unsigned long long)g_total_on_cpu_samples);
     printf("\n");
     printf("Derivation Engine:\n");
     printf("  Total processed  : %llu\n", (unsigned long long)g_derivation->get_total_processed());
@@ -548,18 +548,18 @@ int main(int argc, char **argv)
     printf("[+] Functions: %zu\n", g_func_names.size());
     for (auto &f : g_func_names) printf("    - %s\n", f.c_str());
 
-    /* Open folded stack files */
-    g_oncpu_folded.open("../www/on_cpu.folded",   std::ios::out | std::ios::app);
-    g_offcpu_folded.open("../www/off_cpu.folded", std::ios::out | std::ios::app);
+    /* Open folded stack files — start fresh every run */
+    g_oncpu_folded.open("../www/on_cpu.folded",   std::ios::out | std::ios::trunc);
+    g_offcpu_folded.open("../www/off_cpu.folded", std::ios::out | std::ios::trunc);
 
     /* Init derivation engine */
     g_derivation = new DerivationEngine(on_derived_metrics);
     g_derivation->set_min_duration_ns(0);
     g_derivation->set_min_off_cpu_ns(500);
 
+    bump_memlock_rlimit();
     signal(SIGINT,  sig_handler);
     signal(SIGTERM, sig_handler);
-    bump_memlock_rlimit();
     libbpf_set_print(libbpf_print);
 
     /* ── Load BPF objects ── */
@@ -654,35 +654,35 @@ int main(int argc, char **argv)
     attach_prog(g_offcpu_obj, "write_start",    "syscalls/sys_enter_write");
     attach_prog(g_offcpu_obj, "write_end",      "syscalls/sys_exit_write");
 
-/* ── Attach on-CPU perf sampling (AGGRESSIVE) ── */
-printf("\n[*] Attaching on-CPU sampler...\n");
+    /* ── Attach on-CPU perf sampling (stable + verbose logging) ── */
+    printf("\n[*] Attaching on-CPU sampler...\n");
 
-struct bpf_program *oncpu_prog = bpf_object__find_program_by_name(g_oncpu_obj, "on_cpu_sample");
-if (!oncpu_prog) {
+    struct bpf_program *oncpu_prog = bpf_object__find_program_by_name(g_oncpu_obj, "on_cpu_sample");
+    if (!oncpu_prog) {
     fprintf(stderr, "ERROR: on_cpu_sample not found\n");
-    cleanup(); return 1;
-}
-
-int nr_cpus = libbpf_num_possible_cpus();
-int attached = 0;
-
-struct perf_event_attr pea = {};
-pea.type          = PERF_TYPE_SOFTWARE;
-pea.config        = PERF_COUNT_SW_CPU_CLOCK;   // ← changed (more reliable)
-pea.sample_period =  250000ULL;                  // ← changed to 20 kHz (very aggressive for testing)
-pea.wakeup_events = 1;
-
-printf("    Probing %d CPUs at ~20 kHz...\n", nr_cpus);
-
-for (int cpu = 0; cpu < nr_cpus && cpu < 128; cpu++) {
-    int pfd = syscall(__NR_perf_event_open, &pea, (pid_t)g_target_pid, cpu, -1, 0);
-    if (pfd < 0) continue;
-
-    struct bpf_link *link = bpf_program__attach_perf_event(oncpu_prog, pfd);
-    if (!link) {
-        close(pfd);
-        continue;
+        cleanup(); return 1;
     }
+
+    int nr_cpus = libbpf_num_possible_cpus();
+    int attached = 0;
+
+    struct perf_event_attr pea = {};
+    pea.type          = PERF_TYPE_SOFTWARE;
+    pea.config        = PERF_COUNT_SW_CPU_CLOCK;
+    pea.sample_period = 1000000ULL;                 // every 1M cycles ≈ ~1ms at 1GHz
+    pea.wakeup_events = 1;
+
+    printf("    Probing %d CPUs at 1ms interval (~1000 Hz)...\n", nr_cpus);
+
+    for (int cpu = 0; cpu < nr_cpus && cpu < 128; cpu++) {
+        int pfd = syscall(__NR_perf_event_open, &pea, -1, cpu, -1, PERF_FLAG_FD_CLOEXEC);
+        if (pfd < 0) continue;
+
+        struct bpf_link *link = bpf_program__attach_perf_event(oncpu_prog, pfd);
+        if (!link) {
+            close(pfd);
+            continue;
+        }
 
     if (ioctl(pfd, PERF_EVENT_IOC_ENABLE, 0) == 0) {
         attached++;
@@ -691,14 +691,14 @@ for (int cpu = 0; cpu < nr_cpus && cpu < 128; cpu++) {
         bpf_link__destroy(link);
         close(pfd);
     }
-}
+    }
 
-printf("  → Attached %d on-CPU samplers (~20 kHz)\n", attached);
-if (attached > 0) {
-    printf("  [SUCCESS] High-rate on-CPU sampling active\n");
-} else {
-    fprintf(stderr, "CRITICAL: Failed to attach any on-CPU sampler\n");
-}
+    printf("  → Attached %d on-CPU samplers (~1000 Hz)\n", attached);
+    if (attached > 0) {
+        printf("  [SUCCESS] High-rate on-CPU sampling active\n");
+    } else {
+        fprintf(stderr, "CRITICAL: Failed to attach any on-CPU sampler\n");
+    }
 
     /* ── Ring buffers — BUG FIX #5: separate callbacks ── */
     struct bpf_map *urb  = bpf_object__find_map_by_name(g_uprobe_obj, "events");
@@ -773,7 +773,7 @@ if (attached > 0) {
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
 
     /* Main poll loop */
- time_t last_print = time(nullptr);
+    time_t last_print = time(nullptr);
     while (g_running) {
         if (!g_paused) {
             ring_buffer__poll(g_uprobe_rb, 10);
@@ -806,8 +806,8 @@ if (attached > 0) {
 
                 live_data["entries"]      = g_total_func_entries.load();
                 live_data["exits"]        = g_total_func_exits.load();
-                live_data["oncpu_samples"]= (g_total_on_cpu_samples);
-                live_data["offcpu_events"]= g_total_off_cpu_events.load();   // ← NEW: This was missing!
+                live_data["oncpu_samples"]= g_total_on_cpu_samples.load();
+                live_data["offcpu_events"]= g_total_off_cpu_events.load();
 
                 live_data["processed"]    = g_derivation->get_total_processed();
                 live_data["dropped"]      = g_derivation->get_dropped_short_calls();
