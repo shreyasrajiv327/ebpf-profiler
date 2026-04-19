@@ -53,7 +53,7 @@ void worker_thread() {
     std::cout << "[THREAD " << tid << "] started (PID=" << getpid() << ")\n";
 
     while (running) {
-        worker_inner();                    // nice stack depth
+        worker_inner();                   
         std::this_thread::sleep_for(std::chrono::milliseconds(3));
     }
 }
@@ -73,7 +73,7 @@ int main(int argc, char** argv) {
         threads.emplace_back(worker_thread);
     }
 
-    // Let it run
+  
     std::this_thread::sleep_for(std::chrono::seconds(duration_sec));
 
     running = false;

@@ -4,6 +4,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <sys/ioctl.h>  
 #include <cstring>
 #include <cerrno>
 #include <csignal>
@@ -347,15 +348,30 @@ static int handle_offcpu_event(void * /*ctx*/, void *data, size_t data_sz)
 
 static int handle_oncpu_event(void * /*ctx*/, void *data, size_t data_sz)
 {
+    static uint64_t call_count = 0;
+    call_count++;
+
+    // Print every call so we can see if the callback is alive
+    if (call_count % 50 == 1) {
+        printf("[ONCPU CB] called %llu times | data_sz = %zu\n", 
+               (unsigned long long)call_count, data_sz);
+    }
+
     if (data_sz < sizeof(profiler_event)) {
         fprintf(stderr, "[oncpu] event too small: %zu\n", data_sz);
         return 0;
     }
+
     const profiler_event *evt = static_cast<const profiler_event*>(data);
+
     if (evt->type == EVENT_ON_CPU) {
         g_total_on_cpu_samples++;
+        printf("[ONCPU] ← Real sample received! tid=%u\n", evt->tid);
         g_derivation->process_on_cpu_sample(*evt);
+    } else {
+        printf("[ONCPU] Unexpected type = %u\n", evt->type);
     }
+
     return 0;
 }
 
@@ -373,7 +389,8 @@ static void print_table()
     printf("  Function entries : %llu\n", (unsigned long long)g_total_func_entries);
     printf("  Function exits   : %llu\n", (unsigned long long)g_total_func_exits);
     printf("  Off-CPU events   : %llu\n", (unsigned long long)g_total_off_cpu_events);
-    printf("  On-CPU samples   : %llu\n", (unsigned long long)g_total_on_cpu_samples);
+
+printf("  On-CPU samples   : %llu\n", g_total_on_cpu_samplesp);
     printf("\n");
     printf("Derivation Engine:\n");
     printf("  Total processed  : %llu\n", (unsigned long long)g_derivation->get_total_processed());
@@ -637,46 +654,51 @@ int main(int argc, char **argv)
     attach_prog(g_offcpu_obj, "write_start",    "syscalls/sys_enter_write");
     attach_prog(g_offcpu_obj, "write_end",      "syscalls/sys_exit_write");
 
-    /* Block-level I/O probes removed — covered by read/write syscall probes */
+/* ── Attach on-CPU perf sampling (AGGRESSIVE) ── */
+printf("\n[*] Attaching on-CPU sampler...\n");
 
-    /* ── Attach on-CPU perf sampling ── */
-    printf("\n[*] Attaching on-CPU sampler...\n");
-    struct bpf_program *oncpu_prog =
-        bpf_object__find_program_by_name(g_oncpu_obj, "on_cpu_sample");
-    if (!oncpu_prog) { fprintf(stderr, "on_cpu_sample not found\n"); cleanup(); return 1; }
+struct bpf_program *oncpu_prog = bpf_object__find_program_by_name(g_oncpu_obj, "on_cpu_sample");
+if (!oncpu_prog) {
+    fprintf(stderr, "ERROR: on_cpu_sample not found\n");
+    cleanup(); return 1;
+}
 
-    int nr_cpus = libbpf_num_possible_cpus();
-    bool oncpu_attached = false;
+int nr_cpus = libbpf_num_possible_cpus();
+int attached = 0;
 
-    struct perf_event_attr pea = {};
-    pea.type          = PERF_TYPE_SOFTWARE;
-    pea.config        = PERF_COUNT_SW_TASK_CLOCK;   // ← CHANGED (better for per-process)
-    pea.sample_period = 500000ULL;                  // ← CHANGED (~2000 Hz)
-    pea.wakeup_events = 1;
+struct perf_event_attr pea = {};
+pea.type          = PERF_TYPE_SOFTWARE;
+pea.config        = PERF_COUNT_SW_CPU_CLOCK;   // ← changed (more reliable)
+pea.sample_period =  250000ULL;                  // ← changed to 20 kHz (very aggressive for testing)
+pea.wakeup_events = 1;
 
-    for (int cpu = 0; cpu < nr_cpus && cpu < 128; cpu++) {
-        int pfd = syscall(__NR_perf_event_open, &pea, (pid_t)g_target_pid, cpu, -1, 0);
-        if (pfd < 0) {
-            // printf("  [skip] perf_event_open on CPU %d failed: %s\n", cpu, strerror(errno));
-            continue;
-        }
-        struct bpf_link *link = bpf_program__attach_perf_event(oncpu_prog, pfd);
-        if (link) {
-            oncpu_attached = true;
-            // printf("  [ OK ] on-CPU sampling on CPU %d\n", cpu);
-        } else {
-            close(pfd);
-            // printf("  [FAIL] attach on CPU %d: %s\n", cpu, strerror(errno));
-        }
+printf("    Probing %d CPUs at ~20 kHz...\n", nr_cpus);
+
+for (int cpu = 0; cpu < nr_cpus && cpu < 128; cpu++) {
+    int pfd = syscall(__NR_perf_event_open, &pea, (pid_t)g_target_pid, cpu, -1, 0);
+    if (pfd < 0) continue;
+
+    struct bpf_link *link = bpf_program__attach_perf_event(oncpu_prog, pfd);
+    if (!link) {
+        close(pfd);
+        continue;
     }
 
-    if (!oncpu_attached) {
-        fprintf(stderr, "WARNING: Failed to attach on-CPU sampler on any CPU\n");
-        fprintf(stderr, "         On-CPU Samples will stay at 0 (but derivation still works)\n");
+    if (ioctl(pfd, PERF_EVENT_IOC_ENABLE, 0) == 0) {
+        attached++;
+        printf("    [OK]  CPU %2d  (fd=%d)\n", cpu, pfd);
     } else {
-        printf("  [ OK ] on-CPU sampling (~2000 Hz, %d CPUs)\n", nr_cpus);
+        bpf_link__destroy(link);
+        close(pfd);
     }
+}
 
+printf("  → Attached %d on-CPU samplers (~20 kHz)\n", attached);
+if (attached > 0) {
+    printf("  [SUCCESS] High-rate on-CPU sampling active\n");
+} else {
+    fprintf(stderr, "CRITICAL: Failed to attach any on-CPU sampler\n");
+}
 
     /* ── Ring buffers — BUG FIX #5: separate callbacks ── */
     struct bpf_map *urb  = bpf_object__find_map_by_name(g_uprobe_obj, "events");
@@ -784,7 +806,7 @@ int main(int argc, char **argv)
 
                 live_data["entries"]      = g_total_func_entries.load();
                 live_data["exits"]        = g_total_func_exits.load();
-                live_data["oncpu_samples"]= g_total_on_cpu_samples.load();
+                live_data["oncpu_samples"]= (g_total_on_cpu_samples);
                 live_data["offcpu_events"]= g_total_off_cpu_events.load();   // ← NEW: This was missing!
 
                 live_data["processed"]    = g_derivation->get_total_processed();
