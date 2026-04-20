@@ -1,814 +1,1517 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>eBPF Live Profiler — Photon</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet">
-<style>
-  :root {
-    --bg:        #080c10;
-    --surface:   #0d1117;
-    --panel:     #111820;
-    --border:    #1e2d3d;
-    --border2:   #263445;
-    --text:      #cdd9e5;
-    --muted:     #5c7a96;
-    --accent:    #00d4ff;
-    --accent2:   #0099cc;
-    --on-cpu:    #2563eb;
-    --off-cpu:   #dc4a26;
-    --io:        #d97706;
-    --lock:      #dc2626;
-    --sleep:     #7c3aed;
-    --sched:     #475569;
-    --wall:      #059669;
-    --green:     #22c55e;
-    --yellow:    #eab308;
-    --red:       #ef4444;
-    --radius:    6px;
-    --font-mono: 'JetBrains Mono', monospace;
-    --font-ui:   'Syne', sans-serif;
-  }
-
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-
-  body {
-    background: var(--bg);
-    color: var(--text);
-    font-family: var(--font-mono);
-    font-size: 13px;
-    min-height: 100vh;
-    overflow-x: hidden;
-  }
-
-  body::before {
-    content: '';
-    position: fixed;
-    inset: 0;
-    background-image: linear-gradient(rgba(0,212,255,0.015) 1px, transparent 1px),
-                      linear-gradient(90deg, rgba(0,212,255,0.015) 1px, transparent 1px);
-    background-size: 40px 40px;
-    pointer-events: none;
-    z-index: 0;
-  }
-
-  #header {
-    position: sticky;
-    top: 0;
-    z-index: 100;
-    background: rgba(8,12,16,0.97);
-    backdrop-filter: blur(12px);
-    border-bottom: 1px solid var(--border);
-    padding: 0 18px;
-    height: 54px;
-    display: flex;
-    align-items: center;
-    gap: 16px;
-  }
-
-  #header-title {
-    font-family: var(--font-ui);
-    font-weight: 800;
-    font-size: 14px;
-    color: #fff;
-    white-space: nowrap;
-    display: flex;
-    align-items: center;
-    gap: 9px;
-    flex-shrink: 0;
-  }
-  #header-title .dim { color: var(--muted); font-weight: 400; }
-
-  .status-badge {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    background: rgba(34,197,94,0.1);
-    border: 1px solid rgba(34,197,94,0.25);
-    border-radius: 20px;
-    padding: 3px 10px;
-    font-size: 11px;
-    color: var(--green);
-    white-space: nowrap;
-    flex-shrink: 0;
-  }
-  .status-badge .dot { width:6px;height:6px;border-radius:50%;background:var(--green);animation:pulse 1.4s ease-in-out infinite; }
-  @keyframes pulse { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:.5;transform:scale(.8)} }
-  .status-badge.paused { color:var(--yellow);background:rgba(234,179,8,.1);border-color:rgba(234,179,8,.25); }
-  .status-badge.paused .dot { background:var(--yellow);animation:none; }
-
-  #header-meta {
-    display: flex;
-    gap: 14px;
-    align-items: center;
-    color: var(--muted);
-    font-size: 11px;
-    flex: 1;
-    overflow: hidden;
-  }
-  #header-meta span { white-space:nowrap; }
-  #header-meta strong { color: var(--text); }
-
-  #header-actions { display:flex;gap:7px;flex-shrink:0; }
-
-  .btn {
-    background: var(--panel);
-    border: 1px solid var(--border2);
-    color: var(--text);
-    padding: 5px 11px;
-    border-radius: var(--radius);
-    font-family: var(--font-mono);
-    font-size: 11px;
-    cursor: pointer;
-    transition: all .15s;
-    white-space: nowrap;
-  }
-  .btn:hover { background:var(--border);border-color:var(--muted);color:#fff; }
-  .btn.primary { background:var(--accent2);border-color:var(--accent);color:#000;font-weight:700; }
-  .btn.primary:hover { background:var(--accent); }
-  .btn.danger { border-color:rgba(239,68,68,.4);color:var(--red); }
-  .btn.danger:hover { background:rgba(239,68,68,.1); }
-
-  #app {
-    position: relative;
-    z-index: 1;
-    display: grid;
-    grid-template-columns: 1fr 272px;
-    gap: 11px;
-    padding: 11px 14px 28px;
-    max-width: 1580px;
-    margin: 0 auto;
-  }
-
-  .panel {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    overflow: hidden;
-    animation: fadeIn .35s ease both;
-  }
-  @keyframes fadeIn { from{opacity:0;transform:translateY(8px)} to{opacity:1;transform:translateY(0)} }
-
-  .panel-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 9px 13px;
-    border-bottom: 1px solid var(--border);
-    background: rgba(13,17,23,.5);
-    gap: 10px;
-    flex-wrap: wrap;
-  }
-  .panel-title {
-    font-family: var(--font-ui);
-    font-size: 10px;
-    font-weight: 600;
-    letter-spacing: .08em;
-    text-transform: uppercase;
-    color: var(--muted);
-    flex-shrink: 0;
-  }
-
-  #flamegraph-panel { grid-column:1;grid-row:1; }
-
-  .fg-controls { display:flex;gap:6px;align-items:center;flex-wrap:wrap; }
-
-  .toggle-btn {
-    background: transparent;
-    border: 1px solid var(--border2);
-    color: var(--muted);
-    padding: 4px 11px;
-    border-radius: 4px;
-    font-family: var(--font-mono);
-    font-size: 11px;
-    cursor: pointer;
-    transition: all .15s;
-  }
-  .toggle-btn.active[data-mode="wall"]   { background:rgba(5,150,105,.2);border-color:var(--wall);color:#6ee7b7; }
-  .toggle-btn.active[data-mode="oncpu"]  { background:rgba(37,99,235,.2);border-color:var(--on-cpu);color:#93c5fd; }
-  .toggle-btn.active[data-mode="offcpu"] { background:rgba(220,74,38,.2);border-color:var(--off-cpu);color:#fca5a5; }
-  .toggle-btn:not(.active):hover { border-color:var(--muted);color:var(--text); }
-
-  #fg-search {
-    background:var(--panel);border:1px solid var(--border2);color:var(--text);
-    padding:4px 9px;border-radius:4px;font-family:var(--font-mono);font-size:11px;
-    width:130px;outline:none;margin-left:auto;
-  }
-  #fg-search:focus { border-color:var(--accent2); }
-  #fg-search::placeholder { color:var(--muted); }
-
-  #flamegraph-canvas-wrap { padding:10px;position:relative;min-height:320px; }
-  #flamegraph-svg { width:100%;display:block;cursor:crosshair; }
-
-  #tooltip {
-    position:fixed;background:#0a1520;border:1px solid var(--accent2);
-    border-radius:8px;padding:10px 13px;pointer-events:none;z-index:1000;
-    min-width:210px;display:none;box-shadow:0 8px 32px rgba(0,0,0,.7);
-    font-size:11px;line-height:1.85;
-  }
-  .tt-title { font-family:var(--font-ui);font-size:13px;font-weight:700;color:#fff;margin-bottom:6px;border-bottom:1px solid var(--border2);padding-bottom:6px; }
-  .tt-row { display:flex;justify-content:space-between;gap:14px; }
-  .tt-label { color:var(--muted); }
-  .tt-val { color:var(--text);font-weight:500; }
-  .tt-val.wall { color:#6ee7b7; }
-  .tt-val.oncpu { color:#93c5fd; }
-  .tt-val.offcpu { color:#fca5a5; }
-  .tt-breakdown { margin-top:6px;padding-top:6px;border-top:1px solid var(--border);display:flex;gap:6px;flex-wrap:wrap; }
-  .tt-chip { border-radius:3px;padding:1px 6px;font-size:10px; }
-
-  #sidebar { grid-column:2;grid-row:1/3;display:flex;flex-direction:column;gap:11px; }
-
-  #breakdown-body { padding:13px; }
-  .breakdown-total { font-family:var(--font-ui);font-size:20px;font-weight:800;color:#fff;margin-bottom:3px; }
-  .breakdown-sub { color:var(--muted);font-size:10px;margin-bottom:12px; }
-  .breakdown-bar { height:9px;border-radius:5px;display:flex;overflow:hidden;margin-bottom:11px;gap:1px; }
-  .breakdown-bar-seg { height:100%;transition:width .5s ease; }
-  .breakdown-items { display:flex;flex-direction:column;gap:7px; }
-  .breakdown-item { display:flex;align-items:center;gap:7px;font-size:11px; }
-  .bi-dot { width:7px;height:7px;border-radius:2px;flex-shrink:0; }
-  .bi-name { flex:1;color:var(--muted);font-size:10px; }
-  .bi-bar { flex:2;height:4px;background:var(--panel);border-radius:2px;overflow:hidden; }
-  .bi-fill { height:100%;border-radius:2px;transition:width .5s ease; }
-  .bi-pct { color:var(--text);font-weight:500;width:30px;text-align:right;font-size:10px; }
-  .bi-ms { color:var(--muted);width:56px;text-align:right;font-size:10px; }
-
-  .summary-cards { display:flex;flex-direction:column;gap:7px;padding:9px 13px;border-top:1px solid var(--border); }
-  .s-card { background:var(--panel);border:1px solid var(--border);border-radius:6px;padding:7px 9px; }
-  .s-card-label { color:var(--muted);font-size:9px;text-transform:uppercase;letter-spacing:.07em;margin-bottom:3px; }
-  .s-card-val { font-family:var(--font-ui);font-size:15px;font-weight:700;color:#fff; }
-  .s-card-sub { color:var(--muted);font-size:9px;margin-top:2px; }
-
-  .stats-grid { display:grid;grid-template-columns:1fr 1fr;gap:1px;background:var(--border); }
-  .stat-cell { background:var(--surface);padding:9px 11px; }
-  .stat-label { color:var(--muted);font-size:9px;text-transform:uppercase;letter-spacing:.07em;margin-bottom:2px; }
-  .stat-val { font-family:var(--font-ui);font-size:17px;font-weight:700;color:var(--accent); }
-  .stat-val.warn { color:var(--yellow); }
-  .stat-val.err  { color:var(--red); }
-
-  #table-panel { grid-column:1/3;grid-row:2;animation-delay:.1s; }
-
-  .table-controls { display:flex;gap:7px;align-items:center;flex-wrap:wrap; }
-
-  #tbl-search {
-    background:var(--panel);border:1px solid var(--border2);color:var(--text);
-    padding:4px 9px;border-radius:4px;font-family:var(--font-mono);font-size:11px;
-    width:150px;outline:none;
-  }
-  #tbl-search:focus { border-color:var(--accent2); }
-  #tbl-search::placeholder { color:var(--muted); }
-
-  .seg-group { display:flex;gap:3px; }
-  .seg-btn {
-    background:var(--panel);border:1px solid var(--border2);color:var(--muted);
-    padding:4px 9px;border-radius:4px;font-family:var(--font-mono);font-size:10px;cursor:pointer;transition:all .15s;
-  }
-  .seg-btn.active { background:rgba(0,212,255,.1);border-color:var(--accent2);color:var(--accent); }
-  .seg-btn:hover:not(.active) { border-color:var(--muted);color:var(--text); }
-
-  .table-wrap { overflow-x:auto;max-height:340px;overflow-y:auto; }
-
-  table { width:100%;border-collapse:collapse;font-size:12px; }
-
-  thead th {
-    position:sticky;top:0;background:var(--panel);color:var(--muted);
-    font-size:9px;font-weight:500;text-transform:uppercase;letter-spacing:.07em;
-    padding:8px 9px;text-align:right;border-bottom:1px solid var(--border);
-    cursor:pointer;white-space:nowrap;user-select:none;
-  }
-  thead th:first-child { text-align:left; }
-  thead th:hover { color:var(--text); }
-  thead th.sorted { color:var(--accent); }
-
-  tbody tr { border-bottom:1px solid rgba(30,45,61,.5);transition:background .1s;cursor:pointer; }
-  tbody tr:hover { background:rgba(0,212,255,.04); }
-  tbody tr.highlighted { background:rgba(0,212,255,.08);outline:1px solid rgba(0,212,255,.15); }
-  tbody tr.top5 .fn-name::before { content:'★ ';color:var(--yellow);font-size:9px; }
-
-  tbody td { padding:7px 9px;text-align:right;color:var(--text);white-space:nowrap; }
-  tbody td:first-child { text-align:left; }
-
-  .fn-name { font-family:var(--font-mono);color:#fff;font-size:12px; }
-
-  .eff-bar { display:flex;align-items:center;gap:5px;justify-content:flex-end; }
-  .eff-track { width:44px;height:4px;background:var(--panel);border-radius:2px;overflow:hidden; }
-  .eff-fill { height:100%;border-radius:2px;transition:width .4s; }
-
-  .metric-io    { color:#fbbf24; }
-  .metric-lock  { color:#f87171; }
-  .metric-sleep { color:#c4b5fd; }
-  .metric-sched { color:#94a3b8; }
-  .metric-wall  { color:#6ee7b7; }
-  .metric-on    { color:#93c5fd; }
-  .metric-off   { color:#fca5a5; }
-
-  ::-webkit-scrollbar { width:5px;height:5px; }
-  ::-webkit-scrollbar-track { background:var(--surface); }
-  ::-webkit-scrollbar-thumb { background:var(--border2);border-radius:3px; }
-  ::-webkit-scrollbar-thumb:hover { background:var(--muted); }
-</style>
-</head>
-<body>
-
-<header id="header">
-  <div id="header-title">
-    <svg width="17" height="17" viewBox="0 0 24 24" fill="none">
-      <path d="M12 2L2 7v10l10 5 10-5V7L12 2z" stroke="var(--accent)" stroke-width="1.5"/>
-      <path d="M12 7v10M7 9.5l5 2.5 5-2.5" stroke="var(--accent)" stroke-width="1.5" stroke-linecap="round"/>
-    </svg>
-    eBPF Live Profiler
-    <span class="dim">— <span id="hdr-binary">unknown</span> (PID: <span id="hdr-pid">—</span>)</span>
-  </div>
-
-  <div id="hdr-status" class="status-badge">
-    <div class="dot"></div>
-    <span id="status-text">Connecting…</span>
-  </div>
-
-  <div id="header-meta">
-    <span>Runtime: <strong id="hdr-runtime">0.0s</strong></span>
-    <span>Total Calls: <strong id="hdr-calls">0</strong></span>
-    <span>Entries/Exits: <strong id="hdr-entries">0</strong> / <strong id="hdr-exits">0</strong></span>
-    <span>On-CPU Samples: <strong id="hdr-samples">0</strong></span>
-  </div>
-
-  <div id="header-actions">
-    <button class="btn" id="btn-pause">⏸ Pause</button>
-    <button class="btn danger" id="btn-clear">✕ Clear</button>
-    <button class="btn" id="btn-export-csv">↓ CSV</button>
-    <button class="btn primary" id="btn-export-svg">↓ SVG</button>
-  </div>
-</header>
-
-<div id="app">
-  <!-- FLAMEGRAPH -->
-  <div class="panel" id="flamegraph-panel">
-    <div class="panel-header">
-      <span class="panel-title">Flamegraph</span>
-      <div class="fg-controls">
-        <button class="toggle-btn" data-mode="wall" onclick="setFgMode('wall')">Wall Time</button>
-        <button class="toggle-btn" data-mode="oncpu" onclick="setFgMode('oncpu')">On-CPU</button>
-        <button class="toggle-btn active" data-mode="offcpu" onclick="setFgMode('offcpu')">Off-CPU</button>
-        <input id="fg-search" type="text" placeholder="Search functions…" oninput="filterFg(this.value)">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>eBPF Live Profiler — Photon</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link
+      href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Syne:wght@400;600;700;800&display=swap"
+      rel="stylesheet"
+    />
+    <style>
+      :root {
+        --bg: #080c10;
+        --surface: #0d1117;
+        --panel: #111820;
+        --border: #1e2d3d;
+        --border2: #263445;
+        --text: #cdd9e5;
+        --muted: #5c7a96;
+        --accent: #00d4ff;
+        --accent2: #0099cc;
+        --on-cpu: #2563eb;
+        --off-cpu: #dc4a26;
+        --io: #d97706;
+        --lock: #dc2626;
+        --sleep: #7c3aed;
+        --sched: #475569;
+        --wall: #059669;
+        --green: #22c55e;
+        --yellow: #eab308;
+        --red: #ef4444;
+        --radius: 6px;
+        --font-mono: "JetBrains Mono", monospace;
+        --font-ui: "Syne", sans-serif;
+      }
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+      body {
+        background: var(--bg);
+        color: var(--text);
+        font-family: var(--font-mono);
+        font-size: 13px;
+        min-height: 100vh;
+        overflow-x: hidden;
+      }
+      body::before {
+        content: "";
+        position: fixed;
+        inset: 0;
+        background-image:
+          linear-gradient(rgba(0, 212, 255, 0.015) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(0, 212, 255, 0.015) 1px, transparent 1px);
+        background-size: 40px 40px;
+        pointer-events: none;
+        z-index: 0;
+      }
+      #header {
+        position: sticky;
+        top: 0;
+        z-index: 100;
+        background: rgba(8, 12, 16, 0.97);
+        backdrop-filter: blur(12px);
+        border-bottom: 1px solid var(--border);
+        padding: 0 18px;
+        height: 54px;
+        display: flex;
+        align-items: center;
+        gap: 16px;
+      }
+      #header-title {
+        font-family: var(--font-ui);
+        font-weight: 800;
+        font-size: 14px;
+        color: #fff;
+        white-space: nowrap;
+        display: flex;
+        align-items: center;
+        gap: 9px;
+        flex-shrink: 0;
+      }
+      #header-title .dim {
+        color: var(--muted);
+        font-weight: 400;
+      }
+      .status-badge {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        background: rgba(34, 197, 94, 0.1);
+        border: 1px solid rgba(34, 197, 94, 0.25);
+        border-radius: 20px;
+        padding: 3px 10px;
+        font-size: 11px;
+        color: var(--green);
+        white-space: nowrap;
+        flex-shrink: 0;
+      }
+      .status-badge .dot {
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        background: var(--green);
+        animation: pulse 1.4s ease-in-out infinite;
+      }
+      @keyframes pulse {
+        0%,
+        100% {
+          opacity: 1;
+          transform: scale(1);
+        }
+        50% {
+          opacity: 0.5;
+          transform: scale(0.8);
+        }
+      }
+      .status-badge.paused {
+        color: var(--yellow);
+        background: rgba(234, 179, 8, 0.1);
+        border-color: rgba(234, 179, 8, 0.25);
+      }
+      .status-badge.paused .dot {
+        background: var(--yellow);
+        animation: none;
+      }
+      #header-meta {
+        display: flex;
+        gap: 14px;
+        align-items: center;
+        color: var(--muted);
+        font-size: 11px;
+        flex: 1;
+        overflow: hidden;
+      }
+      #header-meta span {
+        white-space: nowrap;
+      }
+      #header-meta strong {
+        color: var(--text);
+      }
+      #header-actions {
+        display: flex;
+        gap: 7px;
+        flex-shrink: 0;
+      }
+      .btn {
+        background: var(--panel);
+        border: 1px solid var(--border2);
+        color: var(--text);
+        padding: 5px 11px;
+        border-radius: var(--radius);
+        font-family: var(--font-mono);
+        font-size: 11px;
+        cursor: pointer;
+        transition: all 0.15s;
+        white-space: nowrap;
+      }
+      .btn:hover {
+        background: var(--border);
+        border-color: var(--muted);
+        color: #fff;
+      }
+      .btn.primary {
+        background: var(--accent2);
+        border-color: var(--accent);
+        color: #000;
+        font-weight: 700;
+      }
+      .btn.primary:hover {
+        background: var(--accent);
+      }
+      .btn.danger {
+        border-color: rgba(239, 68, 68, 0.4);
+        color: var(--red);
+      }
+      .btn.danger:hover {
+        background: rgba(239, 68, 68, 0.1);
+      }
+      #app {
+        position: relative;
+        z-index: 1;
+        display: grid;
+        grid-template-columns: 1fr 272px;
+        gap: 11px;
+        padding: 11px 14px 28px;
+        max-width: 1580px;
+        margin: 0 auto;
+      }
+      .panel {
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        overflow: hidden;
+        animation: fadeIn 0.35s ease both;
+      }
+      @keyframes fadeIn {
+        from {
+          opacity: 0;
+          transform: translateY(8px);
+        }
+        to {
+          opacity: 1;
+          transform: translateY(0);
+        }
+      }
+      .panel-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 9px 13px;
+        border-bottom: 1px solid var(--border);
+        background: rgba(13, 17, 23, 0.5);
+        gap: 10px;
+        flex-wrap: wrap;
+      }
+      .panel-title {
+        font-family: var(--font-ui);
+        font-size: 10px;
+        font-weight: 600;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: var(--muted);
+        flex-shrink: 0;
+      }
+      #flamegraph-panel {
+        grid-column: 1;
+        grid-row: 1;
+      }
+      .fg-controls {
+        display: flex;
+        gap: 6px;
+        align-items: center;
+        flex-wrap: wrap;
+      }
+      .toggle-btn {
+        background: transparent;
+        border: 1px solid var(--border2);
+        color: var(--muted);
+        padding: 4px 11px;
+        border-radius: 4px;
+        font-family: var(--font-mono);
+        font-size: 11px;
+        cursor: pointer;
+        transition: all 0.15s;
+      }
+      .toggle-btn.active[data-mode="wall"] {
+        background: rgba(5, 150, 105, 0.2);
+        border-color: var(--wall);
+        color: #6ee7b7;
+      }
+      .toggle-btn.active[data-mode="oncpu"] {
+        background: rgba(37, 99, 235, 0.2);
+        border-color: var(--on-cpu);
+        color: #93c5fd;
+      }
+      .toggle-btn.active[data-mode="offcpu"] {
+        background: rgba(220, 74, 38, 0.2);
+        border-color: var(--off-cpu);
+        color: #fca5a5;
+      }
+      .toggle-btn:not(.active):hover {
+        border-color: var(--muted);
+        color: var(--text);
+      }
+      #fg-search {
+        background: var(--panel);
+        border: 1px solid var(--border2);
+        color: var(--text);
+        padding: 4px 9px;
+        border-radius: 4px;
+        font-family: var(--font-mono);
+        font-size: 11px;
+        width: 130px;
+        outline: none;
+        margin-left: auto;
+      }
+      #fg-search:focus {
+        border-color: var(--accent2);
+      }
+      #fg-search::placeholder {
+        color: var(--muted);
+      }
+      #flamegraph-canvas-wrap {
+        padding: 10px;
+        position: relative;
+        min-height: 320px;
+      }
+      #flamegraph-svg {
+        width: 100%;
+        display: block;
+        cursor: crosshair;
+      }
+      /* table tooltip */
+      #tooltip {
+        position: fixed;
+        background: #0a1520;
+        border: 1px solid var(--accent2);
+        border-radius: 8px;
+        padding: 10px 13px;
+        pointer-events: none;
+        z-index: 1000;
+        min-width: 210px;
+        display: none;
+        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.7);
+        font-size: 11px;
+        line-height: 1.85;
+      }
+      .tt-title {
+        font-family: var(--font-ui);
+        font-size: 13px;
+        font-weight: 700;
+        color: #fff;
+        margin-bottom: 6px;
+        border-bottom: 1px solid var(--border2);
+        padding-bottom: 6px;
+      }
+      .tt-row {
+        display: flex;
+        justify-content: space-between;
+        gap: 14px;
+      }
+      .tt-label {
+        color: var(--muted);
+      }
+      .tt-val {
+        color: var(--text);
+        font-weight: 500;
+      }
+      .tt-val.wall {
+        color: #6ee7b7;
+      }
+      .tt-val.oncpu {
+        color: #93c5fd;
+      }
+      .tt-val.offcpu {
+        color: #fca5a5;
+      }
+      .tt-breakdown {
+        margin-top: 6px;
+        padding-top: 6px;
+        border-top: 1px solid var(--border);
+        display: flex;
+        gap: 6px;
+        flex-wrap: wrap;
+      }
+      .tt-chip {
+        border-radius: 3px;
+        padding: 1px 6px;
+        font-size: 10px;
+      }
+      /* flamegraph hover tooltip */
+      #fg-tooltip {
+        position: fixed;
+        background: #0a1520;
+        border: 1px solid var(--accent2);
+        border-radius: 8px;
+        padding: 9px 13px;
+        pointer-events: none;
+        z-index: 1001;
+        min-width: 190px;
+        max-width: 320px;
+        display: none;
+        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.85);
+        font-size: 11px;
+        line-height: 1.8;
+      }
+      #fg-tooltip .fgt-name {
+        font-family: var(--font-ui);
+        font-size: 12px;
+        font-weight: 700;
+        color: #fff;
+        margin-bottom: 6px;
+        padding-bottom: 5px;
+        border-bottom: 1px solid var(--border2);
+        word-break: break-all;
+      }
+      #fg-tooltip .fgt-row {
+        display: flex;
+        justify-content: space-between;
+        gap: 10px;
+      }
+      #fg-tooltip .fgt-label {
+        color: var(--muted);
+      }
+      #fg-tooltip .fgt-val {
+        color: var(--accent);
+        font-weight: 600;
+      }
+      #sidebar {
+        grid-column: 2;
+        grid-row: 1/3;
+        display: flex;
+        flex-direction: column;
+        gap: 11px;
+      }
+      #breakdown-body {
+        padding: 13px;
+      }
+      .breakdown-total {
+        font-family: var(--font-ui);
+        font-size: 20px;
+        font-weight: 800;
+        color: #fff;
+        margin-bottom: 3px;
+      }
+      .breakdown-sub {
+        color: var(--muted);
+        font-size: 10px;
+        margin-bottom: 12px;
+      }
+      .breakdown-bar {
+        height: 9px;
+        border-radius: 5px;
+        display: flex;
+        overflow: hidden;
+        margin-bottom: 11px;
+        gap: 1px;
+      }
+      .breakdown-bar-seg {
+        height: 100%;
+        transition: width 0.5s ease;
+      }
+      .breakdown-items {
+        display: flex;
+        flex-direction: column;
+        gap: 7px;
+      }
+      .breakdown-item {
+        display: flex;
+        align-items: center;
+        gap: 7px;
+        font-size: 11px;
+      }
+      .bi-dot {
+        width: 7px;
+        height: 7px;
+        border-radius: 2px;
+        flex-shrink: 0;
+      }
+      .bi-name {
+        flex: 1;
+        color: var(--muted);
+        font-size: 10px;
+      }
+      .bi-bar {
+        flex: 2;
+        height: 4px;
+        background: var(--panel);
+        border-radius: 2px;
+        overflow: hidden;
+      }
+      .bi-fill {
+        height: 100%;
+        border-radius: 2px;
+        transition: width 0.5s ease;
+      }
+      .bi-pct {
+        color: var(--text);
+        font-weight: 500;
+        width: 30px;
+        text-align: right;
+        font-size: 10px;
+      }
+      .bi-ms {
+        color: var(--muted);
+        width: 56px;
+        text-align: right;
+        font-size: 10px;
+      }
+      .summary-cards {
+        display: flex;
+        flex-direction: column;
+        gap: 7px;
+        padding: 9px 13px;
+        border-top: 1px solid var(--border);
+      }
+      .s-card {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        padding: 7px 9px;
+      }
+      .s-card-label {
+        color: var(--muted);
+        font-size: 9px;
+        text-transform: uppercase;
+        letter-spacing: 0.07em;
+        margin-bottom: 3px;
+      }
+      .s-card-val {
+        font-family: var(--font-ui);
+        font-size: 15px;
+        font-weight: 700;
+        color: #fff;
+      }
+      .s-card-sub {
+        color: var(--muted);
+        font-size: 9px;
+        margin-top: 2px;
+      }
+      .stats-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 1px;
+        background: var(--border);
+      }
+      .stat-cell {
+        background: var(--surface);
+        padding: 9px 11px;
+      }
+      .stat-label {
+        color: var(--muted);
+        font-size: 9px;
+        text-transform: uppercase;
+        letter-spacing: 0.07em;
+        margin-bottom: 2px;
+      }
+      .stat-val {
+        font-family: var(--font-ui);
+        font-size: 17px;
+        font-weight: 700;
+        color: var(--accent);
+      }
+      .stat-val.warn {
+        color: var(--yellow);
+      }
+      .stat-val.err {
+        color: var(--red);
+      }
+      #table-panel {
+        grid-column: 1/3;
+        grid-row: 2;
+        animation-delay: 0.1s;
+      }
+      .table-controls {
+        display: flex;
+        gap: 7px;
+        align-items: center;
+        flex-wrap: wrap;
+      }
+      #tbl-search {
+        background: var(--panel);
+        border: 1px solid var(--border2);
+        color: var(--text);
+        padding: 4px 9px;
+        border-radius: 4px;
+        font-family: var(--font-mono);
+        font-size: 11px;
+        width: 150px;
+        outline: none;
+      }
+      #tbl-search:focus {
+        border-color: var(--accent2);
+      }
+      #tbl-search::placeholder {
+        color: var(--muted);
+      }
+      .seg-group {
+        display: flex;
+        gap: 3px;
+      }
+      .seg-btn {
+        background: var(--panel);
+        border: 1px solid var(--border2);
+        color: var(--muted);
+        padding: 4px 9px;
+        border-radius: 4px;
+        font-family: var(--font-mono);
+        font-size: 10px;
+        cursor: pointer;
+        transition: all 0.15s;
+      }
+      .seg-btn.active {
+        background: rgba(0, 212, 255, 0.1);
+        border-color: var(--accent2);
+        color: var(--accent);
+      }
+      .seg-btn:hover:not(.active) {
+        border-color: var(--muted);
+        color: var(--text);
+      }
+      .table-wrap {
+        overflow-x: auto;
+        max-height: 340px;
+        overflow-y: auto;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 12px;
+      }
+      thead th {
+        position: sticky;
+        top: 0;
+        background: var(--panel);
+        color: var(--muted);
+        font-size: 9px;
+        font-weight: 500;
+        text-transform: uppercase;
+        letter-spacing: 0.07em;
+        padding: 8px 9px;
+        text-align: right;
+        border-bottom: 1px solid var(--border);
+        cursor: pointer;
+        white-space: nowrap;
+        user-select: none;
+      }
+      thead th:first-child {
+        text-align: left;
+      }
+      thead th:hover {
+        color: var(--text);
+      }
+      thead th.sorted {
+        color: var(--accent);
+      }
+      tbody tr {
+        border-bottom: 1px solid rgba(30, 45, 61, 0.5);
+        transition: background 0.1s;
+        cursor: pointer;
+      }
+      tbody tr:hover {
+        background: rgba(0, 212, 255, 0.04);
+      }
+      tbody tr.highlighted {
+        background: rgba(0, 212, 255, 0.08);
+        outline: 1px solid rgba(0, 212, 255, 0.15);
+      }
+      tbody tr.top5 .fn-name::before {
+        content: "★ ";
+        color: var(--yellow);
+        font-size: 9px;
+      }
+      tbody td {
+        padding: 7px 9px;
+        text-align: right;
+        color: var(--text);
+        white-space: nowrap;
+      }
+      tbody td:first-child {
+        text-align: left;
+      }
+      .fn-name {
+        font-family: var(--font-mono);
+        color: #fff;
+        font-size: 12px;
+      }
+      .eff-bar {
+        display: flex;
+        align-items: center;
+        gap: 5px;
+        justify-content: flex-end;
+      }
+      .eff-track {
+        width: 44px;
+        height: 4px;
+        background: var(--panel);
+        border-radius: 2px;
+        overflow: hidden;
+      }
+      .eff-fill {
+        height: 100%;
+        border-radius: 2px;
+        transition: width 0.4s;
+      }
+      .metric-io {
+        color: #fbbf24;
+      }
+      .metric-lock {
+        color: #f87171;
+      }
+      .metric-sleep {
+        color: #c4b5fd;
+      }
+      .metric-sched {
+        color: #94a3b8;
+      }
+      .metric-wall {
+        color: #6ee7b7;
+      }
+      .metric-on {
+        color: #93c5fd;
+      }
+      .metric-off {
+        color: #fca5a5;
+      }
+      ::-webkit-scrollbar {
+        width: 5px;
+        height: 5px;
+      }
+      ::-webkit-scrollbar-track {
+        background: var(--surface);
+      }
+      ::-webkit-scrollbar-thumb {
+        background: var(--border2);
+        border-radius: 3px;
+      }
+      ::-webkit-scrollbar-thumb:hover {
+        background: var(--muted);
+      }
+    </style>
+  </head>
+  <body>
+    <header id="header">
+      <div id="header-title">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none">
+          <path
+            d="M12 2L2 7v10l10 5 10-5V7L12 2z"
+            stroke="var(--accent)"
+            stroke-width="1.5"
+          />
+          <path
+            d="M12 7v10M7 9.5l5 2.5 5-2.5"
+            stroke="var(--accent)"
+            stroke-width="1.5"
+            stroke-linecap="round"
+          />
+        </svg>
+        eBPF Live Profiler
+        <span class="dim"
+          >— <span id="hdr-binary">unknown</span> (PID:
+          <span id="hdr-pid">—</span>)</span
+        >
       </div>
-    </div>
-    <div id="flamegraph-canvas-wrap">
-      <svg id="flamegraph-svg" height="268"></svg>
-    </div>
-  </div>
+      <div id="hdr-status" class="status-badge">
+        <div class="dot"></div>
+        <span id="status-text">Connecting…</span>
+      </div>
 
-  <!-- SIDEBAR -->
-  <div id="sidebar">
-    <div class="panel" id="breakdown-panel" style="animation-delay:.05s">
-      <div class="panel-header"><span class="panel-title">Off-CPU Breakdown</span></div>
-      <div id="breakdown-body">
-        <div class="breakdown-total" id="bk-total">0.000 ms</div>
-        <div class="breakdown-sub">Total off-CPU waiting time across all calls</div>
-        <div class="breakdown-bar" id="bk-bar">
-          <div class="breakdown-bar-seg" style="background:var(--io);width:0%"></div>
-          <div class="breakdown-bar-seg" style="background:var(--lock);width:0%"></div>
-          <div class="breakdown-bar-seg" style="background:var(--sleep);width:0%"></div>
-          <div class="breakdown-bar-seg" style="background:var(--sched);width:0%"></div>
-        </div>
-        <div class="breakdown-items">
-          <div class="breakdown-item">
-            <div class="bi-dot" style="background:var(--io)"></div>
-            <span class="bi-name">IO Wait</span>
-            <div class="bi-bar"><div class="bi-fill" id="bk-io-bar" style="background:var(--io);width:0%"></div></div>
-            <span class="bi-pct" id="bk-io-pct">0%</span>
-            <span class="bi-ms" id="bk-io-ms">0.000 ms</span>
+      <div id="header-actions">
+        <button class="btn" id="btn-pause">⏸ Pause</button>
+        <button class="btn danger" id="btn-clear">✕ Clear</button>
+        <button class="btn" id="btn-export-csv">↓ CSV</button>
+        <button class="btn primary" id="btn-export-svg">↓ SVG</button>
+      </div>
+    </header>
+
+    <div id="app">
+      <div class="panel" id="flamegraph-panel">
+        <div class="panel-header">
+          <span class="panel-title">Flamegraph</span>
+          <div class="fg-controls">
+            <button
+              class="toggle-btn"
+              data-mode="wall"
+              onclick="setFgMode('wall')"
+            >
+              Wall Time
+            </button>
+            <button
+              class="toggle-btn"
+              data-mode="oncpu"
+              onclick="setFgMode('oncpu')"
+            >
+              On-CPU
+            </button>
+            <button
+              class="toggle-btn active"
+              data-mode="offcpu"
+              onclick="setFgMode('offcpu')"
+            >
+              Off-CPU
+            </button>
           </div>
-          <div class="breakdown-item">
-            <div class="bi-dot" style="background:var(--lock)"></div>
-            <span class="bi-name">Lock Contention</span>
-            <div class="bi-bar"><div class="bi-fill" id="bk-lock-bar" style="background:var(--lock);width:0%"></div></div>
-            <span class="bi-pct" id="bk-lock-pct">0%</span>
-            <span class="bi-ms" id="bk-lock-ms">0.000 ms</span>
+        </div>
+        <div id="flamegraph-canvas-wrap">
+          <svg id="flamegraph-svg" height="268"></svg>
+        </div>
+      </div>
+
+      <div id="sidebar">
+        <div class="panel" id="breakdown-panel" style="animation-delay: 0.05s">
+          <div class="panel-header">
+            <span class="panel-title">Off-CPU Breakdown</span>
           </div>
-          <div class="breakdown-item">
-            <div class="bi-dot" style="background:var(--sleep)"></div>
-            <span class="bi-name">Sleep</span>
-            <div class="bi-bar"><div class="bi-fill" id="bk-sleep-bar" style="background:var(--sleep);width:0%"></div></div>
-            <span class="bi-pct" id="bk-sleep-pct">0%</span>
-            <span class="bi-ms" id="bk-sleep-ms">0.000 ms</span>
+          <div id="breakdown-body">
+            <div class="breakdown-total" id="bk-total">0.000 ms</div>
+            <div class="breakdown-sub">
+              Total off-CPU waiting time across all calls
+            </div>
+            <div class="breakdown-bar" id="bk-bar">
+              <div
+                class="breakdown-bar-seg"
+                style="background: var(--io); width: 0%"
+              ></div>
+              <div
+                class="breakdown-bar-seg"
+                style="background: var(--lock); width: 0%"
+              ></div>
+              <div
+                class="breakdown-bar-seg"
+                style="background: var(--sleep); width: 0%"
+              ></div>
+              <div
+                class="breakdown-bar-seg"
+                style="background: var(--sched); width: 0%"
+              ></div>
+            </div>
+            <div class="breakdown-items">
+              <div class="breakdown-item">
+                <div class="bi-dot" style="background: var(--io)"></div>
+                <span class="bi-name">IO Wait</span>
+                <div class="bi-bar">
+                  <div
+                    class="bi-fill"
+                    id="bk-io-bar"
+                    style="background: var(--io); width: 0%"
+                  ></div>
+                </div>
+                <span class="bi-pct" id="bk-io-pct">0%</span
+                ><span class="bi-ms" id="bk-io-ms">0.000 ms</span>
+              </div>
+              <div class="breakdown-item">
+                <div class="bi-dot" style="background: var(--lock)"></div>
+                <span class="bi-name">Lock Contention</span>
+                <div class="bi-bar">
+                  <div
+                    class="bi-fill"
+                    id="bk-lock-bar"
+                    style="background: var(--lock); width: 0%"
+                  ></div>
+                </div>
+                <span class="bi-pct" id="bk-lock-pct">0%</span
+                ><span class="bi-ms" id="bk-lock-ms">0.000 ms</span>
+              </div>
+              <div class="breakdown-item">
+                <div class="bi-dot" style="background: var(--sleep)"></div>
+                <span class="bi-name">Sleep</span>
+                <div class="bi-bar">
+                  <div
+                    class="bi-fill"
+                    id="bk-sleep-bar"
+                    style="background: var(--sleep); width: 0%"
+                  ></div>
+                </div>
+                <span class="bi-pct" id="bk-sleep-pct">0%</span
+                ><span class="bi-ms" id="bk-sleep-ms">0.000 ms</span>
+              </div>
+              <div class="breakdown-item">
+                <div class="bi-dot" style="background: var(--sched)"></div>
+                <span class="bi-name">Scheduler</span>
+                <div class="bi-bar">
+                  <div
+                    class="bi-fill"
+                    id="bk-sched-bar"
+                    style="background: var(--sched); width: 0%"
+                  ></div>
+                </div>
+                <span class="bi-pct" id="bk-sched-pct">0%</span
+                ><span class="bi-ms" id="bk-sched-ms">0.000 ms</span>
+              </div>
+            </div>
           </div>
-          <div class="breakdown-item">
-            <div class="bi-dot" style="background:var(--sched)"></div>
-            <span class="bi-name">Scheduler</span>
-            <div class="bi-bar"><div class="bi-fill" id="bk-sched-bar" style="background:var(--sched);width:0%"></div></div>
-            <span class="bi-pct" id="bk-sched-pct">0%</span>
-            <span class="bi-ms" id="bk-sched-ms">0.000 ms</span>
+          <div class="summary-cards">
+            <div class="s-card">
+              <div class="s-card-label">Biggest Bottleneck</div>
+              <div
+                class="s-card-val"
+                id="bk-biggest"
+                style="font-size: 13px; color: var(--red)"
+              >
+                —
+              </div>
+            </div>
+            <div class="s-card">
+              <div class="s-card-label">Avg CPU Efficiency</div>
+              <div class="s-card-val" id="bk-eff">—</div>
+              <div class="s-card-sub">on-cpu ÷ wall time</div>
+            </div>
+          </div>
+        </div>
+        <div class="panel" id="stats-panel" style="animation-delay: 0.08s">
+          <div class="panel-header">
+            <span class="panel-title">Event Statistics</span>
+          </div>
+          <div class="stats-grid">
+            <div class="stat-cell">
+              <div class="stat-label">Entries</div>
+              <div class="stat-val" id="st-entries">0</div>
+            </div>
+            <div class="stat-cell">
+              <div class="stat-label">Exits</div>
+              <div class="stat-val" id="st-exits">0</div>
+            </div>
+            <div class="stat-cell">
+              <div class="stat-label">Off-CPU Evts</div>
+              <div class="stat-val" id="st-offcpu">0</div>
+            </div>
+            <div class="stat-cell">
+              <div class="stat-label">On-CPU Samples</div>
+              <div class="stat-val" id="st-oncpu">0</div>
+            </div>
+            <div class="stat-cell">
+              <div class="stat-label">Processed</div>
+              <div class="stat-val" id="st-processed">0</div>
+            </div>
+            <div class="stat-cell">
+              <div class="stat-label">Dropped</div>
+              <div class="stat-val warn" id="st-dropped">0</div>
+            </div>
+            <div class="stat-cell" style="grid-column: 1/-1">
+              <div class="stat-label">Errors</div>
+              <div class="stat-val err" id="st-errors">0</div>
+            </div>
           </div>
         </div>
       </div>
-      <div class="summary-cards">
-        <div class="s-card">
-          <div class="s-card-label">Biggest Bottleneck</div>
-          <div class="s-card-val" id="bk-biggest" style="font-size:13px;color:var(--red)">—</div>
+
+      <div class="panel" id="table-panel">
+        <div class="panel-header">
+          <span class="panel-title">Per-Function Details</span>
+          <div class="table-controls">
+            <input
+              id="tbl-search"
+              type="text"
+              placeholder="Filter functions…"
+              oninput="filterTable(this.value)"
+            />
+            <div class="seg-group" id="time-mode-toggle">
+              <button class="seg-btn active" onclick="setTimeMode('abs', this)">
+                ms
+              </button>
+              <button class="seg-btn" onclick="setTimeMode('pct', this)">
+                %
+              </button>
+            </div>
+            <div class="seg-group" id="time-range">
+              <button class="seg-btn active" onclick="setRange('all', this)">
+                All
+              </button>
+              <button class="seg-btn" onclick="setRange('30s', this)">
+                30s
+              </button>
+              <button class="seg-btn" onclick="setRange('10s', this)">
+                10s
+              </button>
+            </div>
+          </div>
         </div>
-        <div class="s-card">
-          <div class="s-card-label">Avg CPU Efficiency</div>
-          <div class="s-card-val" id="bk-eff">—</div>
-          <div class="s-card-sub">on-cpu ÷ wall time</div>
+        <div class="table-wrap">
+          <table id="fn-table">
+            <thead>
+              <tr>
+                <th onclick="sortTable('name')" data-col="name">
+                  Function <span class="sa">&#8597;</span>
+                </th>
+                <th onclick="sortTable('calls')" data-col="calls">
+                  Calls <span class="sa">&#8597;</span>
+                </th>
+                <th onclick="sortTable('wall')" data-col="wall" class="sorted">
+                  Wall <span class="sa">&#8595;</span>
+                </th>
+                <th onclick="sortTable('oncpu')" data-col="oncpu">
+                  On-CPU <span class="sa">&#8597;</span>
+                </th>
+                <th onclick="sortTable('offcpu')" data-col="offcpu">
+                  Off-CPU <span class="sa">&#8597;</span>
+                </th>
+                <th onclick="sortTable('eff')" data-col="eff">
+                  Efficiency <span class="sa">&#8597;</span>
+                </th>
+                <th onclick="sortTable('io')" data-col="io">
+                  IO <span class="sa">&#8597;</span>
+                </th>
+                <th onclick="sortTable('lock')" data-col="lock">
+                  Lock <span class="sa">&#8597;</span>
+                </th>
+                <th onclick="sortTable('sleep')" data-col="sleep">
+                  Sleep <span class="sa">&#8597;</span>
+                </th>
+                <th onclick="sortTable('sched')" data-col="sched">
+                  Sched <span class="sa">&#8597;</span>
+                </th>
+              </tr>
+            </thead>
+            <tbody id="fn-tbody"></tbody>
+          </table>
         </div>
       </div>
     </div>
 
-    <div class="panel" id="stats-panel" style="animation-delay:.08s">
-      <div class="panel-header"><span class="panel-title">Event Statistics</span></div>
-      <div class="stats-grid">
-        <div class="stat-cell"><div class="stat-label">Entries</div><div class="stat-val" id="st-entries">0</div></div>
-        <div class="stat-cell"><div class="stat-label">Exits</div><div class="stat-val" id="st-exits">0</div></div>
-        <div class="stat-cell"><div class="stat-label">Off-CPU Evts</div><div class="stat-val" id="st-offcpu">0</div></div>
-        <div class="stat-cell"><div class="stat-label">On-CPU Samples</div><div class="stat-val" id="st-oncpu">0</div></div>
-        <div class="stat-cell"><div class="stat-label">Processed</div><div class="stat-val" id="st-processed">0</div></div>
-        <div class="stat-cell"><div class="stat-label">Dropped</div><div class="stat-val warn" id="st-dropped">0</div></div>
-        <div class="stat-cell" style="grid-column:1/-1"><div class="stat-label">Errors</div><div class="stat-val err" id="st-errors">0</div></div>
+    <div id="tooltip">
+      <div class="tt-title" id="tt-name">—</div>
+      <div class="tt-row">
+        <span class="tt-label">Wall</span
+        ><span class="tt-val wall" id="tt-wall">—</span>
+      </div>
+      <div class="tt-row">
+        <span class="tt-label">On-CPU</span
+        ><span class="tt-val oncpu" id="tt-on">—</span>
+      </div>
+      <div class="tt-row">
+        <span class="tt-label">Off-CPU</span
+        ><span class="tt-val offcpu" id="tt-off">—</span>
+      </div>
+      <div class="tt-breakdown">
+        <span
+          class="tt-chip"
+          style="background: rgba(217, 119, 6, 0.2); color: #fbbf24"
+          id="tt-io"
+          >IO —</span
+        >
+        <span
+          class="tt-chip"
+          style="background: rgba(220, 38, 38, 0.2); color: #f87171"
+          id="tt-lock"
+          >Lock —</span
+        >
+        <span
+          class="tt-chip"
+          style="background: rgba(124, 58, 237, 0.2); color: #c4b5fd"
+          id="tt-sleep"
+          >Sleep —</span
+        >
+        <span
+          class="tt-chip"
+          style="background: rgba(71, 85, 105, 0.3); color: #94a3b8"
+          id="tt-sched"
+          >Sched —</span
+        >
       </div>
     </div>
-  </div>
 
-  <!-- TABLE -->
-  <div class="panel" id="table-panel">
-    <div class="panel-header">
-      <span class="panel-title">Per-Function Details</span>
-      <div class="table-controls">
-        <input id="tbl-search" type="text" placeholder="Filter functions…" oninput="filterTable(this.value)">
-        <div class="seg-group" id="time-mode-toggle">
-          <button class="seg-btn active" onclick="setTimeMode('abs',this)">ms</button>
-          <button class="seg-btn" onclick="setTimeMode('pct',this)">%</button>
-        </div>
-        <div class="seg-group" id="time-range">
-          <button class="seg-btn active" onclick="setRange('all',this)">All</button>
-          <button class="seg-btn" onclick="setRange('30s',this)">30s</button>
-          <button class="seg-btn" onclick="setRange('10s',this)">10s</button>
-        </div>
+    <div id="fg-tooltip">
+      <div class="fgt-name" id="fgt-name">—</div>
+      <div class="fgt-row">
+        <span class="fgt-label">Value</span
+        ><span class="fgt-val" id="fgt-val">—</span>
+      </div>
+      <div class="fgt-row">
+        <span class="fgt-label">% of total</span
+        ><span class="fgt-val" id="fgt-pct">—</span>
+      </div>
+      <div class="fgt-row">
+        <span class="fgt-label">Stack depth</span
+        ><span class="fgt-val" id="fgt-depth">—</span>
       </div>
     </div>
-    <div class="table-wrap">
-      <table id="fn-table">
-        <thead>
-          <tr>
-            <th onclick="sortTable('name')" data-col="name">Function <span class="sa">↕</span></th>
-            <th onclick="sortTable('calls')" data-col="calls">Calls <span class="sa">↕</span></th>
-            <th onclick="sortTable('wall')" data-col="wall" class="sorted">Wall <span class="sa">↓</span></th>
-            <th onclick="sortTable('oncpu')" data-col="oncpu">On-CPU <span class="sa">↕</span></th>
-            <th onclick="sortTable('offcpu')" data-col="offcpu">Off-CPU <span class="sa">↕</span></th>
-            <th onclick="sortTable('eff')" data-col="eff">Efficiency <span class="sa">↕</span></th>
-            <th onclick="sortTable('io')" data-col="io">IO <span class="sa">↕</span></th>
-            <th onclick="sortTable('lock')" data-col="lock">Lock <span class="sa">↕</span></th>
-            <th onclick="sortTable('sleep')" data-col="sleep">Sleep <span class="sa">↕</span></th>
-            <th onclick="sortTable('sched')" data-col="sched">Sched <span class="sa">↕</span></th>
-          </tr>
-        </thead>
-        <tbody id="fn-tbody"></tbody>
-      </table>
-    </div>
-  </div>
-</div>
 
-<!-- TOOLTIP -->
-<div id="tooltip">
-  <div class="tt-title" id="tt-name">—</div>
-  <div class="tt-row"><span class="tt-label">Wall</span><span class="tt-val wall" id="tt-wall">—</span></div>
-  <div class="tt-row"><span class="tt-label">On-CPU</span><span class="tt-val oncpu" id="tt-on">—</span></div>
-  <div class="tt-row"><span class="tt-label">Off-CPU</span><span class="tt-val offcpu" id="tt-off">—</span></div>
-  <div class="tt-breakdown">
-    <span class="tt-chip" style="background:rgba(217,119,6,.2);color:#fbbf24" id="tt-io">IO —</span>
-    <span class="tt-chip" style="background:rgba(220,38,38,.2);color:#f87171" id="tt-lock">Lock —</span>
-    <span class="tt-chip" style="background:rgba(124,58,237,.2);color:#c4b5fd" id="tt-sleep">Sleep —</span>
-    <span class="tt-chip" style="background:rgba(71,85,105,.3);color:#94a3b8" id="tt-sched">Sched —</span>
-  </div>
-</div>
+    <script>
+      const state = {
+        paused: false,
+        fgMode: "offcpu",
+        timeMode: "abs",
+        timeRange: "all",
+        sortCol: "wall",
+        sortDir: -1,
+        filterFg: "",
+        filterTbl: "",
+        highlightedFn: null,
+        functions: {},
+        stats: {
+          entries: 0,
+          exits: 0,
+          offcpu: 0,
+          oncpu: 0,
+          processed: 0,
+          dropped: 0,
+          errors: 0,
+        },
+        pid: 0,
+        binary: "unknown",
+        runtime_sec: 0,
+      };
 
-<script>
-// STATE
-const state = {
-  paused: false,
-  fgMode: 'offcpu',
-  timeMode: 'abs',
-  timeRange: 'all',
-  sortCol: 'wall',
-  sortDir: -1,
-  filterFg: '',
-  filterTbl: '',
-  highlightedFn: null,
-  functions: {},
-  stats: { entries:0, exits:0, offcpu:0, oncpu:0, processed:0, dropped:0, errors:0 },
-  pid: 0,
-  binary: 'unknown',
-  runtime_sec: 0
-};
+      function fetchData() {
+        fetch("/data")
+          .then((r) => r.json())
+          .then((data) => {
+            if (data.pid) state.pid = data.pid;
+            if (data.binary) state.binary = data.binary;
 
-// FETCH LIVE DATA
-function fetchData() {
-  fetch('/data')
-    .then(r => r.json())
-    .then(data => {
-      if (data.pid) state.pid = data.pid;
-      if (data.binary) state.binary = data.binary;
+            // ✅ FIX: don't overwrite with empty data
+            if (data.functions && Object.keys(data.functions).length > 0) {
+              const newFunctions = {};
 
-      if (data.functions) {
-        state.functions = {};
-        Object.keys(data.functions).forEach(name => {
-          const f = data.functions[name];
-          const wall = f.wall || 0;
-          const oncpu = f.oncpu || 0;
-          const calls = f.calls || 0;
+              Object.keys(data.functions).forEach((name) => {
+                const f = data.functions[name],
+                  wall = f.wall || 0,
+                  oncpu = f.oncpu || 0,
+                  calls = f.calls || 0;
 
-          state.functions[name] = {
-            name: name,
-            calls: calls,
-            wall: wall,
-            oncpu: oncpu,
-            offcpu: f.offcpu || 0,
-            io: f.io || 0,
-            lock: f.lock || 0,
-            sleep: f.sleep || 0,
-            sched: f.sched || 0,
-            eff_sum: calls * (wall > 0 ? oncpu / wall : 0)
+                newFunctions[name] = {
+                  name,
+                  calls,
+                  wall,
+                  oncpu,
+                  offcpu: f.offcpu || 0,
+                  io: f.io || 0,
+                  lock: f.lock || 0,
+                  sleep: f.sleep || 0,
+                  sched: f.sched || 0,
+                  eff_sum: calls * (wall > 0 ? oncpu / wall : 0),
+                };
+              });
+
+              state.functions = newFunctions; // ✅ only update if valid data
+            }
+
+            // stats (these are fine)
+            if (data.entries !== undefined) state.stats.entries = data.entries;
+            if (data.exits !== undefined) state.stats.exits = data.exits;
+            if (data.oncpu_samples !== undefined)
+              state.stats.oncpu = data.oncpu_samples;
+            if (data.offcpu_events !== undefined)
+              state.stats.offcpu = data.offcpu_events;
+            if (data.processed !== undefined)
+              state.stats.processed = data.processed;
+            if (data.dropped !== undefined) state.stats.dropped = data.dropped;
+            if (data.errors !== undefined) state.stats.errors = data.errors;
+            if (data.runtime_sec !== undefined)
+              state.runtime_sec = data.runtime_sec;
+
+            renderAll();
+            updateHeader(); // (you can remove this if already deleted)
+            updateHeaderInfo();
+          })
+          .catch(() => {});
+      }
+
+      function updateHeaderInfo() {
+        document.getElementById("hdr-pid").textContent = state.pid || "—";
+        document.getElementById("hdr-binary").textContent =
+          state.binary || "unknown";
+      }
+
+      // ── FLAMEGRAPH COLORS ──────────────────────────────────────────────────────
+      // Depth-aware palette: cool blues (shallow) → warm amber/coral (deep hot paths)
+      const DEPTH_PALETTES = [
+        ["#1a2330"],
+        ["#1a6fa4", "#1a7a8a", "#1e5f8c", "#1a8080", "#155e8f", "#1a6b7a"],
+        ["#1e7d6b", "#1a7860", "#1d8272", "#217450", "#1a8262", "#1c7870"],
+        ["#2e8b57", "#2a9060", "#327848", "#289468", "#268c52", "#2e9462"],
+        ["#6b8e23", "#7a8c1a", "#688a2a", "#7a8a1c", "#648c22", "#708c20"],
+        ["#b8860b", "#c08010", "#b87e0c", "#b88210", "#be8408", "#b07e14"],
+        ["#c8621a", "#cc5c14", "#c8641c", "#ca5e16", "#c46018", "#cc6420"],
+        ["#c84b2a", "#ca4424", "#c8502e", "#cc4828", "#c44c2c", "#c84e30"],
+      ];
+      function getFlameColor(name, depth) {
+        const row = DEPTH_PALETTES[Math.min(depth, DEPTH_PALETTES.length - 1)];
+        let h = 0;
+        for (let i = 0; i < name.length; i++)
+          h = (name.charCodeAt(i) + ((h << 5) - h)) | 0;
+        return row[Math.abs(h) % row.length];
+      }
+      function labelColor(hex) {
+        const c = hex.replace("#", "");
+        const r = parseInt(c.slice(0, 2), 16),
+          g = parseInt(c.slice(2, 4), 16),
+          b = parseInt(c.slice(4, 6), 16);
+        return (0.299 * r + 0.587 * g + 0.114 * b) / 255 > 0.45
+          ? "#1a1a1a"
+          : "#edf2f7";
+      }
+
+      // ── FOLDED DATA ────────────────────────────────────────────────────────────
+      let currentFoldedData = {};
+      function loadFoldedFile(mode) {
+        const filename =
+          mode === "oncpu" ? "/on_cpu.folded" : "/off_cpu.folded";
+        fetch(filename)
+          .then((r) => r.text())
+          .then((text) => {
+            currentFoldedData[mode] = parseFolded(text);
+            renderFlamegraph();
+          })
+          .catch(() => renderFlamegraph());
+      }
+      function parseFolded(text) {
+        const lines = text.trim().split("\n");
+        const root = { name: "root", value: 0, children: {} };
+        lines.forEach((line) => {
+          if (!line.trim()) return;
+          const parts = line.trim().split(" ");
+          if (parts.length < 2) return;
+          const value = parseFloat(parts[1]) || 0;
+          if (value <= 0) return;
+          let stack = parts[0].split(";");
+          if (stack[0] === "root") stack = stack.slice(1);
+          let node = root;
+          stack.forEach((name) => {
+            if (!name) return;
+            if (!node.children[name])
+              node.children[name] = { name, value: 0, children: {} };
+            node = node.children[name];
+            node.value += value;
+          });
+          root.value += value;
+        });
+        function toTree(node) {
+          const children = Object.values(node.children)
+            .map(toTree)
+            .sort((a, b) => b.value - a.value);
+          return {
+            name: node.name,
+            value: node.value,
+            children: children.length ? children : undefined,
           };
+        }
+        return toTree(root);
+      }
+
+      // ── FLAMEGRAPH RENDER ──────────────────────────────────────────────────────
+      function renderFlamegraph() {
+        const svg = document.getElementById("flamegraph-svg");
+        const wrap = document.getElementById("flamegraph-canvas-wrap");
+        const W = wrap.clientWidth - 20 || 800;
+        const mode = state.fgMode;
+        let data;
+        if (mode === "wall") {
+          const total = Object.values(state.functions).reduce(
+            (s, f) => s + (f.wall || 0),
+            0,
+          );
+          data = {
+            name: "root",
+            value: total,
+            children: Object.values(state.functions)
+              .map((f) => ({ name: f.name, value: f.wall || 0 }))
+              .sort((a, b) => b.value - a.value),
+          };
+        } else {
+          data = currentFoldedData[mode];
+        }
+        if (
+          !data ||
+          !data.children ||
+          !data.children.length ||
+          data.value === 0
+        ) {
+          svg.innerHTML = `<text x="${W / 2}" y="160" text-anchor="middle" fill="#64748b" font-size="15" font-family="JetBrains Mono">Waiting for ${mode.toUpperCase()} data…<tspan x="${W / 2}" dy="22" font-size="12" fill="#4a6a8a">(root: ${data ? data.value : 0})</tspan></text>`;
+          svg.setAttribute("height", 320);
+          return;
+        }
+        const ROW_H = 32,
+          MAX_H = 820,
+          totalVal = data.value;
+        const rects = [],
+          texts = [];
+        function draw(node, x, width, depth) {
+          if (width < 2) return;
+          const y = MAX_H - (depth + 1) * ROW_H - 8;
+          const fill =
+            depth === 0 ? "#1a2330" : getFlameColor(node.name, depth);
+          const tc = depth === 0 ? "#4a6a8a" : labelColor(fill);
+          const pct =
+            totalVal > 0 ? ((node.value / totalVal) * 100).toFixed(2) : "0.00";
+          const sn = node.name
+            .replace(/&/g, "&amp;")
+            .replace(/"/g, "&quot;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;");
+          rects.push(
+            `<rect x="${x.toFixed(1)}" y="${y}" width="${Math.max(width - 1, 1).toFixed(1)}" height="${ROW_H - 4}" rx="3" fill="${fill}" stroke="#0d1117" stroke-width="0.8" data-name="${sn}" data-val="${node.value}" data-pct="${pct}" data-depth="${depth}" onmouseover="showFgTip(event,this)" onmousemove="moveFgTip(event)" onmouseout="hideFgTip()" onclick="zoomFlame(this)"/>`,
+          );
+          if (width > 44) {
+            const mc = Math.floor((width - 10) / 7.0);
+            let label =
+              node.name.length > mc
+                ? node.name.substring(0, Math.max(mc - 1, 3)) + "…"
+                : node.name;
+            const sl = label
+              .replace(/&/g, "&amp;")
+              .replace(/</g, "&lt;")
+              .replace(/>/g, "&gt;");
+            texts.push(
+              `<text x="${(x + 6).toFixed(1)}" y="${y + Math.floor(ROW_H / 2) + 5}" fill="${tc}" font-size="11.5" font-family="JetBrains Mono,monospace" pointer-events="none">${sl}</text>`,
+            );
+          }
+          if (node.children) {
+            let cx = x;
+            node.children.forEach((child) => {
+              const cw = (child.value / node.value) * width;
+              draw(child, cx, cw, depth + 1);
+              cx += cw;
+            });
+          }
+        }
+        draw(data, 0, W, 0);
+        svg.innerHTML = rects.join("") + texts.join("");
+        svg.setAttribute("height", MAX_H);
+      }
+
+      // ── FLAMEGRAPH TOOLTIP ─────────────────────────────────────────────────────
+      function showFgTip(event, el) {
+        const tt = document.getElementById("fg-tooltip");
+        document.getElementById("fgt-name").textContent =
+          el.getAttribute("data-name") || "—";
+        document.getElementById("fgt-val").textContent =
+          Number(el.getAttribute("data-val") || 0).toLocaleString() + " µs";
+        document.getElementById("fgt-pct").textContent =
+          (el.getAttribute("data-pct") || "0.00") + "%";
+        document.getElementById("fgt-depth").textContent =
+          el.getAttribute("data-depth") || "0";
+        tt.style.display = "block";
+        moveFgTip(event);
+      }
+      function moveFgTip(event) {
+        const tt = document.getElementById("fg-tooltip");
+        let x = event.clientX + 14,
+          y = event.clientY - 10;
+        if (x + 250 > window.innerWidth) x = event.clientX - 260;
+        if (y + 150 > window.innerHeight) y = event.clientY - 160;
+        tt.style.left = x + "px";
+        tt.style.top = y + "px";
+      }
+      function hideFgTip() {
+        document.getElementById("fg-tooltip").style.display = "none";
+      }
+      function zoomFlame(el) {
+        const n = el.getAttribute("data-name");
+        if (n) selectFn(n);
+      }
+
+      // ── BREAKDOWN ──────────────────────────────────────────────────────────────
+      function updateBreakdown() {
+        const fns = Object.values(state.functions);
+        let io = 0,
+          lock = 0,
+          sleep = 0,
+          sched = 0,
+          eff_sum = 0,
+          cnt = 0;
+        fns.forEach((f) => {
+          io += f.io || 0;
+          lock += f.lock || 0;
+          sleep += f.sleep || 0;
+          sched += f.sched || 0;
+          eff_sum += f.eff_sum || 0;
+          cnt += f.calls || 0;
+        });
+        const totalOff = io + lock + sleep + sched;
+        document.getElementById("bk-total").textContent =
+          totalOff.toFixed(3) + " ms";
+        const segs = document.querySelectorAll("#bk-bar .breakdown-bar-seg");
+        [io, lock, sleep, sched].forEach(
+          (v, i) =>
+            (segs[i].style.width =
+              (totalOff > 0 ? (v / totalOff) * 100 : 0) + "%"),
+        );
+        const parts = [
+          { k: "io", v: io },
+          { k: "lock", v: lock },
+          { k: "sleep", v: sleep },
+          { k: "sched", v: sched },
+        ];
+        const maxV = Math.max(...parts.map((p) => p.v), 1);
+        parts.forEach((p) => {
+          const pct = totalOff > 0 ? (p.v / totalOff) * 100 : 0;
+          document.getElementById("bk-" + p.k + "-pct").textContent =
+            pct.toFixed(0) + "%";
+          document.getElementById("bk-" + p.k + "-ms").textContent =
+            p.v.toFixed(2) + " ms";
+          document.getElementById("bk-" + p.k + "-bar").style.width =
+            (p.v / maxV) * 100 + "%";
+        });
+        const big = parts.reduce((a, b) => (a.v > b.v ? a : b));
+        const bigPct = totalOff > 0 ? ((big.v / totalOff) * 100).toFixed(0) : 0;
+        const labels = {
+          io: "IO Wait",
+          lock: "Lock Contention",
+          sleep: "Sleep",
+          sched: "Scheduler",
+        };
+        document.getElementById("bk-biggest").textContent =
+          big.v > 0 ? `${labels[big.k]} (${bigPct}%)` : "—";
+        document.getElementById("bk-eff").textContent =
+          cnt > 0 ? ((eff_sum / cnt) * 100).toFixed(1) + "%" : "—";
+      }
+
+      // ── STATS ──────────────────────────────────────────────────────────────────
+      function updateStats() {
+        const s = state.stats;
+        [
+          "entries",
+          "exits",
+          "offcpu",
+          "oncpu",
+          "processed",
+          "dropped",
+          "errors",
+        ].forEach((k) => {
+          const el = document.getElementById("st-" + k);
+          if (el) el.textContent = (s[k] || 0).toLocaleString();
         });
       }
 
-      if (data.entries !== undefined) state.stats.entries = data.entries;
-      if (data.exits !== undefined) state.stats.exits = data.exits;
-      if (data.oncpu_samples !== undefined) state.stats.oncpu = data.oncpu_samples;
-      if (data.offcpu_events !== undefined) state.stats.offcpu = data.offcpu_events;
-      if (data.processed !== undefined) state.stats.processed = data.processed;
-      if (data.dropped !== undefined) state.stats.dropped = data.dropped;
-      if (data.errors !== undefined) state.stats.errors = data.errors;
-
-      if (data.runtime_sec !== undefined) state.runtime_sec = data.runtime_sec;
-
-      renderAll();
-      updateHeader();
-      updateHeaderInfo();
-    })
-    .catch(() => {});
-}
-
-function updateHeader(){
-  const tot = Object.values(state.functions).reduce((a, f) => a + (f.calls || 0), 0);
-  document.getElementById('hdr-calls').textContent = tot.toLocaleString();
-  document.getElementById('hdr-entries').textContent = state.stats.entries.toLocaleString();
-  document.getElementById('hdr-exits').textContent = state.stats.exits.toLocaleString();
-  document.getElementById('hdr-samples').textContent = state.stats.oncpu.toLocaleString();
-
-  if (state.runtime_sec !== undefined) {
-    document.getElementById('hdr-runtime').textContent = state.runtime_sec.toFixed(1) + 's';
-  }
-}
-
-function updateHeaderInfo() {
-  document.getElementById('hdr-pid').textContent = state.pid || '—';
-  document.getElementById('hdr-binary').textContent = state.binary || 'unknown';
-}
-
-// FLAMEGRAPH
-let currentFoldedData = {};
-
-function loadFoldedFile(mode) {
-  const filename = mode === 'oncpu' ? '/on_cpu.folded' : '/off_cpu.folded';
-  fetch(filename)
-    .then(r => r.text())
-    .then(text => {
-      currentFoldedData[mode] = parseFolded(text);
-      renderFlamegraph();
-    })
-    .catch(() => renderFlamegraph());
-}
-
-function getFlameColor(name) {
-  // Better, more readable color palette
-  let hash = 0;
-  for (let i = 0; i < name.length; i++) {
-    hash = name.charCodeAt(i) + ((hash << 5) - hash);
-  }
-  const hue = Math.abs(hash) % 360;
-  
-  // High saturation + good brightness range for readability
-  return `hsl(${hue}, 88%, 62%)`;
-}
-
-function parseFolded(text) {
-  const lines = text.trim().split('\n');
-  const root = { name: "root", value: 0, children: {} };
-
-  lines.forEach(line => {
-    if (!line.trim()) return;
-    const parts = line.trim().split(' ');
-    if (parts.length < 2) return;
-
-    const stackStr = parts[0];
-    const value = parseFloat(parts[1]) || 0;
-    if (value <= 0) return;
-
-    let stack = stackStr.split(';');
-
-    // Skip the leading "root" if present (your files start with root;)
-    if (stack[0] === "root") stack = stack.slice(1);
-
-    let node = root;
-    stack.forEach(name => {
-      if (!name) return;
-      if (!node.children[name]) {
-        node.children[name] = { name: name, value: 0, children: {} };
+      // ── TABLE TOOLTIP ──────────────────────────────────────────────────────────
+      function showTip(e, name) {
+        const f = state.functions[name];
+        if (!f) return;
+        const tt = document.getElementById("tooltip");
+        const onPct = f.wall > 0 ? ((f.oncpu / f.wall) * 100).toFixed(1) : 0;
+        const offPct = f.wall > 0 ? ((f.offcpu / f.wall) * 100).toFixed(1) : 0;
+        document.getElementById("tt-name").textContent = name;
+        document.getElementById("tt-wall").textContent =
+          f.wall.toFixed(3) + " ms";
+        document.getElementById("tt-on").textContent =
+          f.oncpu.toFixed(3) + ` ms (${onPct}%)`;
+        document.getElementById("tt-off").textContent =
+          f.offcpu.toFixed(3) + ` ms (${offPct}%)`;
+        document.getElementById("tt-io").textContent =
+          "IO " + f.io.toFixed(2) + " ms";
+        document.getElementById("tt-lock").textContent =
+          "Lock " + f.lock.toFixed(2) + " ms";
+        document.getElementById("tt-sleep").textContent =
+          "Sleep " + f.sleep.toFixed(2) + " ms";
+        document.getElementById("tt-sched").textContent =
+          "Sched " + f.sched.toFixed(2) + " ms";
+        tt.style.display = "block";
+        moveTip(e);
       }
-      node = node.children[name];
-      node.value += value;          // accumulate on every level
-    });
+      function moveTip(e) {
+        const tt = document.getElementById("tooltip");
+        let x = e.clientX + 14,
+          y = e.clientY - 10;
+        if (x + 230 > window.innerWidth) x = e.clientX - 240;
+        if (y + 200 > window.innerHeight) y = e.clientY - 210;
+        tt.style.left = x + "px";
+        tt.style.top = y + "px";
+      }
+      function hideTip() {
+        document.getElementById("tooltip").style.display = "none";
+      }
 
-    // Also add to root so top-level width works
-    root.value += value;
-  });
-
-  console.log(`✅ Parsed ${lines.length} folded lines → root.value = ${root.value}`);
-
-  function toTree(node) {
-    const children = Object.values(node.children)
-      .map(toTree)
-      .sort((a, b) => b.value - a.value);
-    return { 
-      name: node.name, 
-      value: node.value, 
-      children: children.length ? children : undefined 
-    };
-  }
-  return toTree(root);
-}
-
-function renderFlamegraph() {
-  const svg = document.getElementById('flamegraph-svg');
-  const wrap = document.getElementById('flamegraph-canvas-wrap');
-  const W = wrap.clientWidth - 20 || 800;
-  const mode = state.fgMode;
-
-  let data;
-  if (mode === 'wall') {
-    const total = Object.values(state.functions).reduce((sum, f) => sum + (f.wall || 0), 0);
-    data = { name: "root", value: total, children: Object.values(state.functions).map(f => ({name: f.name, value: f.wall || 0})).sort((a,b)=>b.value-a.value) };
-  } else {
-    data = currentFoldedData[mode];
-  }
-
-  if (!data || !data.children || data.children.length === 0 || data.value === 0) {
-    svg.innerHTML = `<text x="${W/2}" y="160" text-anchor="middle" fill="#64748b" font-size="15" font-family="JetBrains Mono">
-      Waiting for ${mode.toUpperCase()} data...<br>
-      <tspan x="${W/2}" dy="22" font-size="12" fill="#94a3b8">(Parsed ${data ? data.value : 0} µs)</tspan>
-    </text>`;
-    svg.setAttribute('height', 320);
-    return;
-  }
-
-  let html = '';
-  const ROW_H = 32;
-  const MAX_H = 820;   // tall enough for your 12+ frame stacks
-
-  function draw(node, x, width, depth) {
-    if (width < 2) return;
-    const y = MAX_H - (depth + 1) * ROW_H - 8;
-
-    const color = depth === 0 ? '#1a2330' : getFlameColor(node.name);
-    html += `<rect x="${x}" y="${y}" width="${width}" height="${ROW_H-6}" rx="4" fill="${color}" stroke="#0f1824" onclick="zoomFlame(this)" data-name="${node.name}"/>`;
-
-    if (width > 60) {
-      const label = node.name.length > 45 ? node.name.substring(0,42)+'…' : node.name;
-      html += `<text x="${x+8}" y="${y+ROW_H/2+9}" fill="#000" font-size="12.5" font-family="JetBrains Mono">${label}</text>`;
-    }
-
-    if (node.children) {
-      let cx = x;
-      node.children.forEach(child => {
-        const cw = (child.value / node.value) * width || 0;
-        draw(child, cx, cw, depth + 1);
-        cx += cw;
-      });
-    }
-  }
-
-  draw(data, 0, W, 0);
-  svg.innerHTML = html;
-  svg.setAttribute('height', MAX_H);
-}
-
-function loadInitialFlamegraph() {
-  loadFoldedFile('offcpu');
-}
-
-// BREAKDOWN
-function updateBreakdown(){
-  const fns = Object.values(state.functions);
-  let io = 0, lock = 0, sleep = 0, sched = 0, eff_sum = 0, cnt = 0;
-  fns.forEach(f => {
-    io += f.io || 0; lock += f.lock || 0; sleep += f.sleep || 0; sched += f.sched || 0;
-    eff_sum += f.eff_sum || 0;
-    cnt += f.calls || 0;
-  });
-  const totalOff = io + lock + sleep + sched;
-  document.getElementById('bk-total').textContent = totalOff.toFixed(3) + ' ms';
-  const segs = document.querySelectorAll('#bk-bar .breakdown-bar-seg');
-  [io, lock, sleep, sched].forEach((v, i) => segs[i].style.width = (totalOff > 0 ? v / totalOff * 100 : 0) + '%');
-  const parts = [{k:'io',v:io},{k:'lock',v:lock},{k:'sleep',v:sleep},{k:'sched',v:sched}];
-  const maxV = Math.max(...parts.map(p => p.v), 1);
-  parts.forEach(p => {
-    const pct = totalOff > 0 ? p.v / totalOff * 100 : 0;
-    document.getElementById('bk-' + p.k + '-pct').textContent = pct.toFixed(0) + '%';
-    document.getElementById('bk-' + p.k + '-ms').textContent = p.v.toFixed(2) + ' ms';
-    document.getElementById('bk-' + p.k + '-bar').style.width = (p.v / maxV * 100) + '%';
-  });
-  const big = parts.reduce((a, b) => a.v > b.v ? a : b);
-  const bigPct = totalOff > 0 ? (big.v / totalOff * 100).toFixed(0) : 0;
-  const labels = {io:'IO Wait', lock:'Lock Contention', sleep:'Sleep', sched:'Scheduler'};
-  document.getElementById('bk-biggest').textContent = big.v > 0 ? `${labels[big.k]} (${bigPct}%)` : '—';
-  document.getElementById('bk-eff').textContent = cnt > 0 ? (eff_sum / cnt * 100).toFixed(1) + '%' : '—';
-}
-
-// STATS
-function updateStats(){
-  const s = state.stats;
-  ['entries','exits','offcpu','oncpu','processed','dropped','errors'].forEach(k => {
-    const el = document.getElementById('st-' + k);
-    if (el) el.textContent = (s[k] || 0).toLocaleString();
-  });
-}
-
-// TOOLTIP
-function showTip(e, name){ 
-  const f = state.functions[name];
-  if (!f) return;
-  const tt = document.getElementById('tooltip');
-  document.getElementById('tt-name').textContent = name;
-  const onPct = f.wall > 0 ? (f.oncpu / f.wall * 100).toFixed(1) : 0;
-  const offPct = f.wall > 0 ? (f.offcpu / f.wall * 100).toFixed(1) : 0;
-  document.getElementById('tt-wall').textContent = f.wall.toFixed(3) + ' ms';
-  document.getElementById('tt-on').textContent = f.oncpu.toFixed(3) + ` ms (${onPct}%)`;
-  document.getElementById('tt-off').textContent = f.offcpu.toFixed(3) + ` ms (${offPct}%)`;
-  document.getElementById('tt-io').textContent = 'IO ' + f.io.toFixed(2) + ' ms';
-  document.getElementById('tt-lock').textContent = 'Lock ' + f.lock.toFixed(2) + ' ms';
-  document.getElementById('tt-sleep').textContent = 'Sleep ' + f.sleep.toFixed(2) + ' ms';
-  document.getElementById('tt-sched').textContent = 'Sched ' + f.sched.toFixed(2) + ' ms';
-  tt.style.display = 'block';
-  moveTip(e);
-}
-function moveTip(e){
-  const tt = document.getElementById('tooltip');
-  let x = e.clientX + 14, y = e.clientY - 10;
-  if (x + 230 > window.innerWidth) x = e.clientX - 240;
-  if (y + 200 > window.innerHeight) y = e.clientY - 210;
-  tt.style.left = x + 'px'; tt.style.top = y + 'px';
-}
-function hideTip(){ 
-  document.getElementById('tooltip').style.display = 'none'; 
-}
-
-// TABLE
-let _sCol = 'wall', _sDir = {wall: -1};
-function sortTable(col){
-  if (_sCol === col) _sDir[col] = (_sDir[col] || -1) * -1;
-  else { _sCol = col; _sDir[col] = -1; }
-  state.sortCol = col; state.sortDir = _sDir[col];
-  document.querySelectorAll('thead th').forEach(th => { th.classList.remove('sorted'); th.querySelector('.sa').textContent = '↕'; });
-  const th = document.querySelector(`thead th[data-col="${col}"]`);
-  if (th) { th.classList.add('sorted'); th.querySelector('.sa').textContent = state.sortDir < 0 ? '↓' : '↑'; }
-  renderTable();
-}
-
-function renderTable(){
-  const tbody = document.getElementById('fn-tbody');
-  let fns = Object.values(state.functions).filter(f => f.calls > 0);
-  const search = state.filterTbl.toLowerCase();
-  if (search) fns = fns.filter(f => f.name.toLowerCase().includes(search));
-
-  const top5 = Object.values(state.functions).filter(f => f.calls > 0).sort((a,b) => b.wall - a.wall).slice(0,5).map(f => f.name);
-  const isPct = state.timeMode === 'pct';
-  const maxW = Math.max(...fns.map(f => f.wall), 1);
-
-  const colMap = {name:'name',calls:'calls',wall:'wall',oncpu:'oncpu',offcpu:'offcpu',eff:'eff_sum',io:'io',lock:'lock',sleep:'sleep',sched:'sched'};
-  const col = colMap[state.sortCol] || 'wall';
-
-  fns.sort((a,b) => {
-    const av = col === 'name' ? a.name : col === 'eff_sum' ? a.eff_sum / Math.max(a.calls,1) : a[col];
-    const bv = col === 'name' ? b.name : col === 'eff_sum' ? b.eff_sum / Math.max(b.calls,1) : b[col];
-    if (typeof av === 'string') return state.sortDir * av.localeCompare(bv);
-    return state.sortDir * (bv - av);
-  });
-
-  const fmt = ms => isPct ? (ms / maxW * 100).toFixed(1) + '%' : ms.toFixed(3) + ' ms';
-
-  if (!fns.length) {
-    tbody.innerHTML = `<tr><td colspan="10" style="text-align:center;padding:40px;color:var(--muted)">No functions match your filter.</td></tr>`;
-    return;
-  }
-
-  tbody.innerHTML = fns.map(f => {
-    const eff = f.eff_sum / Math.max(f.calls, 1);
-    const effPct = (eff * 100).toFixed(1);
-    const ec = eff > .6 ? 'var(--green)' : eff > .3 ? 'var(--yellow)' : 'var(--red)';
-    const isTop = top5.includes(f.name);
-    const isHl = f.name === state.highlightedFn;
-    return `<tr class="${isTop ? 'top5' : ''} ${isHl ? 'highlighted' : ''}" onclick="selectFn('${f.name.replace(/'/g,"\\'")}')">
+      // ── TABLE ──────────────────────────────────────────────────────────────────
+      let _sCol = "wall",
+        _sDir = { wall: -1 };
+      function sortTable(col) {
+        if (_sCol === col) _sDir[col] = (_sDir[col] || -1) * -1;
+        else {
+          _sCol = col;
+          _sDir[col] = -1;
+        }
+        state.sortCol = col;
+        state.sortDir = _sDir[col];
+        document.querySelectorAll("thead th").forEach((th) => {
+          th.classList.remove("sorted");
+          th.querySelector(".sa").innerHTML = "&#8597;";
+        });
+        const th = document.querySelector(`thead th[data-col="${col}"]`);
+        if (th) {
+          th.classList.add("sorted");
+          th.querySelector(".sa").innerHTML =
+            state.sortDir < 0 ? "&#8595;" : "&#8593;";
+        }
+        renderTable();
+      }
+      function renderTable() {
+        const tbody = document.getElementById("fn-tbody");
+        let fns = Object.values(state.functions).filter((f) => f.calls > 0);
+        const search = state.filterTbl.toLowerCase();
+        if (search)
+          fns = fns.filter((f) => f.name.toLowerCase().includes(search));
+        const top5 = Object.values(state.functions)
+          .filter((f) => f.calls > 0)
+          .sort((a, b) => b.wall - a.wall)
+          .slice(0, 5)
+          .map((f) => f.name);
+        const isPct = state.timeMode === "pct";
+        const maxW = Math.max(...fns.map((f) => f.wall), 1);
+        const colMap = {
+          name: "name",
+          calls: "calls",
+          wall: "wall",
+          oncpu: "oncpu",
+          offcpu: "offcpu",
+          eff: "eff_sum",
+          io: "io",
+          lock: "lock",
+          sleep: "sleep",
+          sched: "sched",
+        };
+        const col = colMap[state.sortCol] || "wall";
+        fns.sort((a, b) => {
+          const av =
+            col === "name"
+              ? a.name
+              : col === "eff_sum"
+                ? a.eff_sum / Math.max(a.calls, 1)
+                : a[col];
+          const bv =
+            col === "name"
+              ? b.name
+              : col === "eff_sum"
+                ? b.eff_sum / Math.max(b.calls, 1)
+                : b[col];
+          if (typeof av === "string")
+            return state.sortDir * av.localeCompare(bv);
+          return state.sortDir * (bv - av);
+        });
+        const fmt = (ms) =>
+          isPct ? ((ms / maxW) * 100).toFixed(1) + "%" : ms.toFixed(3) + " ms";
+        if (!fns.length) {
+          tbody.innerHTML = `<tr><td colspan="10" style="text-align:center;padding:40px;color:var(--muted)">No functions match your filter.</td></tr>`;
+          return;
+        }
+        tbody.innerHTML = fns
+          .map((f) => {
+            const eff = f.eff_sum / Math.max(f.calls, 1);
+            const effPct = (eff * 100).toFixed(1);
+            const ec =
+              eff > 0.6
+                ? "var(--green)"
+                : eff > 0.3
+                  ? "var(--yellow)"
+                  : "var(--red)";
+            const isTop = top5.includes(f.name);
+            const isHl = f.name === state.highlightedFn;
+            const esc = f.name.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+            return `<tr class="${isTop ? "top5" : ""} ${isHl ? "highlighted" : ""}" onclick="selectFn('${esc}')" onmouseover="showTip(event,'${esc}')" onmousemove="moveTip(event)" onmouseout="hideTip()">
       <td><span class="fn-name">${f.name}</span></td>
       <td>${f.calls.toLocaleString()}</td>
       <td class="metric-wall">${fmt(f.wall)}</td>
@@ -820,93 +1523,144 @@ function renderTable(){
       <td class="metric-sleep">${fmt(f.sleep)}</td>
       <td class="metric-sched">${fmt(f.sched)}</td>
     </tr>`;
-  }).join('');
-}
+          })
+          .join("");
+      }
 
-// CONTROLS
-function setFgMode(mode) {
-  state.fgMode = mode;
-  document.querySelectorAll('.toggle-btn').forEach(b => b.classList.remove('active'));
-  document.querySelector(`.toggle-btn[data-mode="${mode}"]`).classList.add('active');
+      // ── CONTROLS ──────────────────────────────────────────────────────────────
+      function setFgMode(mode) {
+        state.fgMode = mode;
+        document
+          .querySelectorAll(".toggle-btn")
+          .forEach((b) => b.classList.remove("active"));
+        document
+          .querySelector(`.toggle-btn[data-mode="${mode}"]`)
+          .classList.add("active");
+        if (mode !== "wall") {
+          loadFoldedFile(mode);
+          setTimeout(() => loadFoldedFile(mode), 300);
+        }
+        renderFlamegraph();
+      }
 
-  if (mode !== 'wall') {
-    loadFoldedFile(mode);           // already there
-    // Extra: force refresh every time you switch tab
-    setTimeout(() => loadFoldedFile(mode), 300);
-  }
-  renderFlamegraph();
-}
+      function filterTable(v) {
+        state.filterTbl = v;
+        renderTable();
+      }
+      function setTimeMode(mode, btn) {
+        state.timeMode = mode;
+        document
+          .querySelectorAll("#time-mode-toggle .seg-btn")
+          .forEach((b) => b.classList.remove("active"));
+        btn.classList.add("active");
+        renderTable();
+      }
+      function setRange(r, btn) {
+        state.timeRange = r;
+        document
+          .querySelectorAll("#time-range .seg-btn")
+          .forEach((b) => b.classList.remove("active"));
+        btn.classList.add("active");
+      }
+      function selectFn(name) {
+        state.highlightedFn = state.highlightedFn === name ? null : name;
+        renderFlamegraph();
+        renderTable();
+      }
 
-function filterFg(v){ state.filterFg = v; renderFlamegraph(); }
-function filterTable(v){ state.filterTbl = v; renderTable(); }
-function setTimeMode(mode, btn){ state.timeMode = mode; document.querySelectorAll('#time-mode-toggle .seg-btn').forEach(b => b.classList.remove('active')); btn.classList.add('active'); renderTable(); }
-function setRange(r, btn){ state.timeRange = r; document.querySelectorAll('#time-range .seg-btn').forEach(b => b.classList.remove('active')); btn.classList.add('active'); }
-function selectFn(name){ state.highlightedFn = state.highlightedFn === name ? null : name; renderFlamegraph(); renderTable(); }
+      document.getElementById("btn-pause").addEventListener("click", () => {
+        const isPausing = !state.paused;
+        fetch("/control", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ command: isPausing ? "pause" : "resume" }),
+        })
+          .then(() => {
+            state.paused = isPausing;
+            const btn = document.getElementById("btn-pause");
+            const badge = document.getElementById("hdr-status");
+            const textEl = document.getElementById("status-text");
+            if (state.paused) {
+              btn.textContent = "▶ Resume";
+              badge.className = "status-badge paused";
+              textEl.textContent = "Paused";
+            } else {
+              btn.textContent = "⏸ Pause";
+              badge.className = "status-badge";
+              textEl.textContent = "Connected";
+            }
+          })
+          .catch(() => console.warn("Could not reach backend"));
+      });
 
-document.getElementById('btn-pause').addEventListener('click', () => {
-  const isPausing = !state.paused;
-  const cmd = isPausing ? 'pause' : 'resume';
-  fetch('/control', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ command: cmd })
-  })
-  .then(() => {
-    state.paused = isPausing;
-    const btn = document.getElementById('btn-pause');
-    const badge = document.getElementById('hdr-status');
-    const textEl = document.getElementById('status-text');
-    if (state.paused) {
-      btn.textContent = '▶ Resume';
-      badge.className = 'status-badge paused';
-      textEl.textContent = 'Paused';
-    } else {
-      btn.textContent = '⏸ Pause';
-      badge.className = 'status-badge';
-      textEl.textContent = 'Connected';
-    }
-  })
-  .catch(() => console.warn("Could not reach backend"));
-});
+      document.getElementById("btn-clear").addEventListener("click", () => {
+        state.functions = {};
+        state.stats = {
+          entries: 0,
+          exits: 0,
+          offcpu: 0,
+          oncpu: 0,
+          processed: 0,
+          dropped: 0,
+          errors: 0,
+        };
+        renderAll();
+      });
 
-document.getElementById('btn-clear').addEventListener('click', () => {
-  state.functions = {};
-  state.stats = {entries:0, exits:0, offcpu:0, oncpu:0, processed:0, dropped:0, errors:0};
-  renderAll();
-});
+      document
+        .getElementById("btn-export-csv")
+        .addEventListener("click", () => {
+          const rows = Object.values(state.functions).map((f) => {
+            const eff = ((f.eff_sum / Math.max(f.calls, 1)) * 100).toFixed(1);
+            return [
+              f.name,
+              f.calls,
+              f.wall.toFixed(3),
+              f.oncpu.toFixed(3),
+              f.offcpu.toFixed(3),
+              eff + "%",
+              f.io.toFixed(3),
+              f.lock.toFixed(3),
+              f.sleep.toFixed(3),
+              f.sched.toFixed(3),
+            ].join(",");
+          });
+          const csv =
+            "Function,Calls,Wall(ms),OnCPU(ms),OffCPU(ms),Efficiency,IO(ms),Lock(ms),Sleep(ms),Sched(ms)\n" +
+            rows.join("\n");
+          const a = document.createElement("a");
+          a.href = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
+          a.download = "ebpf_profiler.csv";
+          a.click();
+        });
 
-document.getElementById('btn-export-csv').addEventListener('click', () => {
-  const rows = Object.values(state.functions).map(f => {
-    const eff = (f.eff_sum / Math.max(f.calls,1) * 100).toFixed(1);
-    return [f.name, f.calls, f.wall.toFixed(3), f.oncpu.toFixed(3), f.offcpu.toFixed(3), eff + '%', f.io.toFixed(3), f.lock.toFixed(3), f.sleep.toFixed(3), f.sched.toFixed(3)].join(',');
-  });
-  const csv = 'Function,Calls,Wall(ms),OnCPU(ms),OffCPU(ms),Efficiency,IO(ms),Lock(ms),Sleep(ms),Sched(ms)\n' + rows.join('\n');
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(new Blob([csv], {type: 'text/csv'}));
-  a.download = 'ebpf_profiler.csv'; a.click();
-});
+      document
+        .getElementById("btn-export-svg")
+        .addEventListener("click", () => {
+          const svg = document.getElementById("flamegraph-svg");
+          const a = document.createElement("a");
+          a.href = URL.createObjectURL(
+            new Blob([svg.outerHTML], { type: "image/svg+xml" }),
+          );
+          a.download = "flamegraph.svg";
+          a.click();
+        });
 
-document.getElementById('btn-export-svg').addEventListener('click', () => {
-  const svg = document.getElementById('flamegraph-svg');
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(new Blob([svg.outerHTML], {type: 'image/svg+xml'}));
-  a.download = 'flamegraph.svg'; a.click();
-});
-
-// RENDER + START
-function renderAll(){
-  renderFlamegraph();
-  renderTable();
-  updateBreakdown();
-  updateStats();
-  updateHeader();
-  updateHeaderInfo();
-}
-
-setInterval(fetchData, 300);
-setInterval(renderAll, 300);
-fetchData();
-loadInitialFlamegraph();
-</script>
-</body>
+      function renderAll() {
+        renderFlamegraph();
+        renderTable();
+        updateBreakdown();
+        updateStats();
+        updateHeader();
+        updateHeaderInfo();
+      }
+      function loadInitialFlamegraph() {
+        loadFoldedFile("offcpu");
+      }
+      setInterval(fetchData, 300);
+      setInterval(renderAll, 300);
+      fetchData();
+      loadInitialFlamegraph();
+    </script>
+  </body>
 </html>
