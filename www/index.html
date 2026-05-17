@@ -1070,8 +1070,9 @@
         fetch("/data")
           .then((r) => r.json())
           .then((data) => {
-            if (data.pid) state.pid = data.pid;
-            if (data.binary) state.binary = data.binary;
+            if (data.pid !== undefined && data.pid !== 0) state.pid = data.pid;
+            if (data.binary && data.binary !== "unknown")
+              state.binary = data.binary;
 
             // ✅ FIX: don't overwrite with empty data
             if (data.functions && Object.keys(data.functions).length > 0) {
