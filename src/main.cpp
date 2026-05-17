@@ -737,6 +737,14 @@ int main(int argc, char **argv)
 
     printf("\n[+] Profiling started — table updates every second\n\n");
 
+    {
+    std::lock_guard<std::mutex> lock(data_mutex);
+    live_data["pid"] = g_target_pid;
+    std::string basename = g_binary_path.empty() ? "unknown"
+                         : g_binary_path.substr(g_binary_path.find_last_of('/') + 1);
+    live_data["binary"] = basename;
+}
+
     /* Start Web UI with pause/resume control */
     web_thread = std::thread([]() {
 

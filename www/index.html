@@ -1116,7 +1116,6 @@
               state.runtime_sec = data.runtime_sec;
 
             renderAll();
-            updateHeader(); // (you can remove this if already deleted)
             updateHeaderInfo();
           })
           .catch(() => {});
@@ -1652,7 +1651,6 @@
         renderTable();
         updateBreakdown();
         updateStats();
-        updateHeader();
         updateHeaderInfo();
       }
       function loadInitialFlamegraph() {
